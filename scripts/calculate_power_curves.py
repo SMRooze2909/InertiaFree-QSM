@@ -54,27 +54,27 @@ if __name__ == "__main__":
     # )
 
     # Generate power curves using optimized simulation
-    result = constructor.generate_power_curves_optimized(
-        cluster_ids=None,
-        output_path=OUTPUT_PATH_OPTIMIZED,
-        verbose=True,
-        show_plot=True,
-        save_plot=True,
-        validate_file=True,
+    #result = constructor.generate_power_curves_optimized(
+    #    cluster_ids=None,
+    #    output_path=OUTPUT_PATH_OPTIMIZED,
+    #    verbose=True,
+    #    show_plot=True,
+    #    save_plot=True,
+    #    validate_file=True,
+    #)
+
+    #result = constructor.simulate_single_wind_speed(
+    #    wind_speed=4.8, method="direct",
+    #    output_path=OUTPUT_PATH_DIRECT_SINGLE_POINT,
+    #    verbose=True, show_plot=True, save_plot=True,
+    #    validate_file=True
+    #)
+
+    result = constructor.simulate_single_wind_speed(
+        wind_speed=8, method="direct",
+        output_path=OUTPUT_PATH_OPTIMIZED_SINGLE_POINT,
+        verbose=True, show_plot=True, save_plot=True,
+        validate_file=True
     )
-
-    # result = constructor.simulate_single_wind_speed(
-    #     wind_speed=4.8, method="direct",
-    #     output_path=OUTPUT_PATH_DIRECT_SINGLE_POINT,
-    #     verbose=True, show_plot=True, save_plot=True,
-    #     validate_file=True
-    # )
-
-    # result = constructor.simulate_single_wind_speed(
-    #     wind_speed=4.8, method="optimization",
-    #     output_path=OUTPUT_PATH_OPTIMIZED_SINGLE_POINT,
-    #     verbose=True, show_plot=True, save_plot=True,
-    #     validate_file=True
-    # )
   
 
