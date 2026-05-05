@@ -68,7 +68,7 @@ class PureTractionSolver:
         self.env_state = env_state
         self.steady_state_config = steady_state_config or {}
 
-    def solve(self, wind, traction_input, vessel_state):
+    def solve(self, wind, traction_input, vessel_state, enforce_tether_limit=True):
 
         self.env_state.set_reference_wind_speed(wind.speed)
         self.env_state.downwind_direction = wind.direction
@@ -89,7 +89,7 @@ class PureTractionSolver:
         ss.control_settings = ("reeling_factor", 0.0)
         ss.find_state(self.sys_props, self.env_state, kin)
         max_force = getattr(self.sys_props, "tether_force_max_limit", None)
-        if max_force is not None and ss.tether_force_ground > max_force:
+        if enforce_tether_limit and max_force is not None and ss.tether_force_ground > max_force:
             raise ValueError(
                 f"Pure traction tether force exceeds limit: "
                 f"{ss.tether_force_ground:.1f} N > {max_force:.1f} N"

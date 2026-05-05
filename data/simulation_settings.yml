@@ -238,3 +238,32 @@ steady_state:
 phase_solver:
   # Maximum number of time points before terminating a phase simulation
   max_time_points: 5000
+
+# ============================================================================
+# PURE TRACTION OPTIMIZATION SETTINGS
+# ============================================================================
+
+traction_optimization:
+  optimizer:
+    max_iterations: 200
+    ftol: 1.0e-8
+    eps: 1.0e-3
+
+    # [azimuth_angle, elevation_angle, course_angle] in degrees
+    x0: [11.5, 30.0, 93.0]
+
+    # x_scaled = x / scaling
+    scaling: [30.0, 30.0, 90.0]
+
+  bounds:
+    azimuth_angle_min: -90.0
+    azimuth_angle_max: 90.0
+
+    elevation_angle_min: 10.0
+    elevation_angle_max: 80.0
+
+    course_angle_min: 0.0
+    course_angle_max: 180.0
+
+  constraints:
+    require_positive_surge: true
