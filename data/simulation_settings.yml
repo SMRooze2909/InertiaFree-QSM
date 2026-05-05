@@ -155,7 +155,7 @@ cycle:
 
   # Tether length at end of traction phase as fraction of max tether length [-]
   # (= start of RORI transition; must be < 1.0 to leave reel-out headroom)
-  tether_length_end_traction: 0.95
+  tether_length_end_traction: 0.93
 
   # Tether length at end of retraction as fraction of max tether length [-]
   tether_length_end_retraction: 0.65

@@ -1,247 +1,216 @@
-# InertiaFree-QSM
+readme_text = """# InertiaFree-QSM (Extended for Moving-Vessel Applications)
 
-InertiaFree-QSM is a quasi-steady modeling workflow for evaluating kite power system cycle performance and power curves.
-The modeling approach follows work by van der Vlugt et al. [1] and the code is based on the work of Schelbergen [2].
+This repository is a fork and extension of the original InertiaFree-QSM model:
+https://github.com/jbredael/InertiaFree-QSM
 
-**Disclaimer:** This repository is still in development.
+The original model implements a quasi-steady pumping-cycle simulation for airborne wind energy systems based on van der Vlugt et al. (2019) and Schelbergen (2024).
 
-## Project structure
-
-```text
-InertiaFree-QSM/
-├── data/         # Input configuration and wind resource files (YAML)
-├── results/      # Generated results and plots
-├── scripts/      # Entry-point scripts for calculations and plotting
-└── src/          # Core package code (inertiafree_qsm)
-```
-
-## Installation
-
-1. Clone the repository:
-    ```bash
-    git clone https://github.com/jbredael/InertiaFree-QSM.git
-    cd InertiaFree-QSM
-    ```
-
-2. Create and activate a virtual environment:
-
-    Linux / macOS:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-
-    Windows (PowerShell):
-    ```bash
-    python -m venv venv
-    .\venv\Scripts\Activate
-    ```
-
-3. Install the package:
-
-    For users (run the example scripts):
-    ```bash
-    pip install .
-    ```
-
-    For developers (editable install with dev tools):
-    ```bash
-    pip install -e .[dev]
-    ```
-
-4. To deactivate the virtual environment when you are done:
-    ```bash
-    deactivate
-    ```
-
-## Inputs
-
-All input files are YAML files. Three input files are required:
-
-| File | Description |
-|------|-------------|
-| **System configuration** | Kite and tether system properties (e.g. `kitepower V3_20.yml`). This is an [awesIO](https://github.com/awegroup/awesIO) standard file. |
-| **Wind resource** | Wind profile and cluster data (e.g. `wind_resource.yml`). This is an [awesIO](https://github.com/awegroup/awesIO) standard file. |
-| **Simulation settings** | Solver, optimizer, and cycle parameters (e.g. `simulation_settings.yml`). |
-
-Example `simulation_settings.yml`:
-
-```yaml
-# Simulation settings for the inertia-free quasi-steady model
-# All angles are in degrees
-
-general:
-  method: 'direct_simulation'
-
-aerodynamics:
-  kite_lift_coefficient_reel_out: 0.63
-  kite_drag_coefficient_reel_out: 0.14
-  kite_lift_coefficient_reel_in: 0.4
-  kite_drag_coefficient_reel_in: 0.12
-  tether_drag_coefficient: 1.1
-
-direct_simulation:
-  wind_speeds:
-    cut_in: 6.0
-    cut_out: 25.0
-    n_points: 20
-    fine_resolution:
-      n_points_near_cutout: 0
-      range_m_s: 2.0
-
-optimization:
-  wind_speeds:
-    cut_in: 3.0
-    cut_out: 25.0
-    n_points: 25
-    fine_resolution:
-      n_points_near_cutout: 0
-      range_m_s: 2.0
-  optimizer:
-    optimize_variables:
-      reeling_speed_traction: true
-      reeling_speed_retraction: true
-      fraction_tether_length_traction_end: true
-      fraction_tether_length_retraction_end: true
-      elevation_angle_traction: true
-      elevation_angle_end_trans_rori: true
-    max_iterations: 200
-    ftol: 5.0e-2
-    eps: 5.0e-2
-    x0: [2, -2, 0.65, 0.9, 30.0, 50.0]
-    scaling: [1, 1, 1, 1, 30, 30]
-  bounds:
-    reeling_speed_traction_min: 0.01
-    reeling_speed_traction_max: 15.0
-    reeling_speed_retraction_min: -15.0
-    reeling_speed_retraction_max: -0.01
-    fraction_tether_length_traction_end_min: 0.8
-    fraction_tether_length_traction_end_max: 0.95
-    fraction_tether_length_retraction_end_min: 0.4
-    fraction_tether_length_retraction_end_max: 0.8
-    elevation_angle_traction_min: 10.0
-    elevation_angle_traction_max: 60.0
-    elevation_angle_end_trans_rori_min: 30.0
-    elevation_angle_end_trans_rori_max: 80.0
-  constraints:
-    min_tether_length_fraction_difference: 0.1
-    max_difference_elevation_angle_steps: 10.0
-
-cycle:
-  minimum_tether_force: 750.0
-  minimum_height: 100.0
-  elevation_angle_traction: [30.0, 30.0, 30.0, 30.0]
-  tether_length_end_traction: 0.95
-  tether_length_end_retraction: 0.65
-  include_transition_energy: true
-  elevation_angle_end_trans_rori: 50.0
-
-retraction:
-  control: ['reeling_speed', -2.0]
-  time_step: 0.25
-  azimuth_angle: 0.0
-  course_angle: 180.0
-
-transition_riro:
-  control: ['reeling_speed', 0]
-  time_step: 0.05
-  azimuth_angle: 0.0
-  course_angle: 0.0
-
-transition_rori:
-  control: ['reeling_speed', 0]
-  time_step: 0.05
-  azimuth_angle: 0.0
-  course_angle: 180.0
-
-traction:
-  control: ['reeling_speed', 2.0]
-  time_step: 0.25
-  azimuth_angle: 11.5
-  course_angle: 93.0
-
-steady_state:
-  max_iterations: 250
-  convergence_tolerance: 1.0e-3
-
-phase_solver:
-  max_time_points: 5000
-```
-
-## Usage
-
-Use the example scripts in the `scripts/` directory to run simulations and generate plots:
-```bash
-python scripts/calculate_power_curves.py
-```
-
-### Creating a constructor
-
-All workflows start by instantiating a `PowerCurveConstructor` with paths to the three input files:
-
-```python
-from inertiafree_qsm import PowerCurveConstructor
-
-constructor = PowerCurveConstructor(
-    system_config_path="data/kitepower V3_20.yml",
-    wind_resource_path="data/wind_resource.yml",
-    simulation_settings_path="data/simulation_settings.yml",
-)
-```
-
-### Generating power curves (direct simulation)
-
-`generate_power_curves_direct` runs the QSM with pre-defined cycle parameters from the simulation settings file. This is the fastest method but does not optimize cycle performance.
-
-```python
-result = constructor.generate_power_curves_direct(
-    cluster_ids=None,        # None = all clusters
-    output_path="results/power_curves_direct.yml",
-    verbose=True,
-    show_plot=True,
-    save_plot=True,
-)
-```
-
-### Generating power curves (optimization)
-
-`generate_power_curves_optimized` uses SLSQP optimization to find the reeling speeds, tether lengths, and elevation angles that maximize average cycle power at each wind speed. Warm starts are used between consecutive wind speeds for faster convergence.
-
-```python
-result = constructor.generate_power_curves_optimized(
-    cluster_ids=None,        # None = all clusters
-    output_path="results/power_curves_optimized.yml",
-    verbose=True,
-    show_plot=True,
-    save_plot=True,
-)
-```
-
-### Simulating a single wind speed
-
-`simulate_single_wind_speed` evaluates one wind speed point using either method and returns the same output structure as the full power curve methods.
-
-```python
-result = constructor.simulate_single_wind_speed(
-    wind_speed=8.0,          # Reference wind speed [m/s]
-    cluster_id=1,
-    method="optimization",   # 'direct' or 'optimization'
-    output_path="results/single_point.yml",
-    show_plot=True,
-    save_plot=True,
-)
-```
-
-## Output
-
-The main output is a power curves YAML file in the [awesIO](https://github.com/awegroup/awesIO) standard format. It contains the power curve data for each wind cluster, including cut-in and cut-out wind speeds, nominal power, and per-wind-speed performance indicators.
-
-The time history of the cycle simulation (kite kinematics and tether states at each time step) is saved as a separate `.npz` file alongside the YAML output.
+This fork extends the framework toward maritime applications, enabling modelling of kite systems on moving vessels with consistent traction and pumping evaluation.
 
 
+EXTENSION SCOPE
+---------------
 
-## References
+Main additions:
+- Moving-vessel apparent wind coupling
+- Consistent traction and pumping evaluation
+- Ship-frame force projection
+- Equivalent propulsion-power metrics
+- Heading-dependent operational maps
 
-[1] R. van der Vlugt, A. Bley, M. Noom, and R. Schmehl: "Quasi-Steady Model of a Pumping Kite Power System". In Renewable Energy, 131, 2019, pp. 83--99. https://doi.org/10.1016/j.renene.2018.07.023
 
-[2] M. Schelbergen: "Power to the Airborne Wind Energy Performance Model". 2024. https://doi.org/10.4233/uuid:353d390a-9b79-44f1-9847-136a6b880e12
+ADDED FILES AND SCRIPTS
+-----------------------
+
+scripts/
+
+test_pumping_with_apparent_wind.py  
+Runs the pumping-cycle model using apparent wind from a moving vessel.  
+Projects cycle forces into ship axes and computes equivalent propulsion benefit.
+
+test_traction_with_apparent_wind.py  
+Evaluates traction mode under apparent wind conditions.  
+Includes both constrained and unconstrained operation to diagnose force behavior.
+
+pumping_moving_vessel_matrix.py  
+Runs large parameter sweeps over:
+- wind speed
+- ship speed
+- heading  
+Outputs CSV files and performs physical consistency checks.
+
+traction_moving_vessel_matrix.py  
+Same as pumping matrix, but for traction mode.  
+Includes unconstrained solver option to investigate force envelope and constraint effects.
+
+test_pumping_force_projection.py  
+Standalone verification of force projection logic from QSM frame to ship frame.
+
+test_pure_traction.py  
+Baseline traction solver test without vessel coupling.
+
+test_vessel_coupling.py  
+Validation script for apparent wind computation and vessel motion coupling.
+
+
+src/inertiafree_qsm/
+
+coordinate_transforms.py  
+Core transformation logic:
+- QSM frame -> global frame -> ship frame  
+Ensures physically consistent mapping of tether forces.
+
+vessel_coupling.py  
+Implements:
+- true wind definition
+- vessel motion
+- apparent wind computation
+
+force_projection.py  
+Utilities for projecting distributed and point forces into model DOFs or vessel axes.
+
+operating_point.py  
+Defines operating-point structures for traction calculations:
+- vessel state
+- wind condition
+
+pure_traction.py  
+Standalone quasi-steady traction solver:
+- computes tether force
+- computes resulting vessel forces
+
+
+MOVING-VESSEL COUPLING
+----------------------
+
+The vessel motion is included through the apparent wind:
+
+    V_app = V_true - V_ship
+
+The QSM model is evaluated using the apparent wind speed and direction.
+
+
+COORDINATE SYSTEM CONVENTION
+----------------------------
+
+The QSM model operates in an apparent-wind-aligned frame.
+
+Transformation chain:
+
+    QSM frame -> global frame -> ship frame
+
+Key assumptions:
+- QSM azimuth = kite position direction
+- tether force acts from vessel toward kite
+- ship axes:
+    Fx = surge (forward)
+    Fy = sway
+
+
+PUMPING MODE
+------------
+
+Outputs:
+- cycle power: P_cycle
+- cycle-averaged forces: Fx_avg, Fy_avg
+
+Equivalent propulsion benefit:
+
+    P_equiv_pumping = P_cycle + Fx_avg * V_ship
+
+
+TRACTION MODE
+-------------
+
+Outputs:
+- tether force
+- Fx (surge)
+- Fy (sway)
+
+Equivalent propulsion benefit:
+
+    P_equiv_traction = Fx * V_ship
+
+
+UNCONSTRAINED TRACTION DIAGNOSTIC
+--------------------------------
+
+If tether force exceeds limit:
+- constraint is temporarily disabled
+- solution is still computed
+
+Purpose:
+- verify coordinate system correctness
+- understand force envelope
+
+These results are NOT physically feasible.
+
+
+CURRENT MODELLING STATUS
+------------------------
+
+Implemented:
+- apparent wind coupling
+- coordinate transformations
+- pumping cycle simulation
+- traction force evaluation
+- equivalent propulsion metrics
+- heading sweeps
+- matrix simulations with verification checks
+
+Not yet implemented:
+- vessel equilibrium (PPP)
+- leeway angle
+- resistance model
+- propulsion system model
+- traction optimization
+- depowering control
+- economic analysis
+
+
+NEXT STEPS
+----------
+
+1) TRACTION OPTIMIZATION  
+Optimize:
+- azimuth angle
+- elevation angle
+- course angle  
+Objective:
+    maximize Fx or P_equiv_traction  
+Constraint:
+    tether_force <= limit
+
+2) CONSTRAINED TRACTION MODEL  
+Replace unconstrained solver with:
+- depowering strategy OR
+- infeasible masking
+
+3) FULL VESSEL COUPLING  
+Couple:
+    kite forces + resistance + propulsion  
+Solve full equilibrium
+
+4) UNIFIED MODE COMPARISON  
+Compare traction and pumping using:
+    equivalent propulsion benefit
+
+5) ECONOMIC EVALUATION  
+Combine with wind statistics to compute:
+- fuel savings
+- system value
+
+
+REFERENCES
+----------
+
+[1] R. van der Vlugt et al., 2019  
+Quasi-Steady Model of a Pumping Kite Power System  
+Renewable Energy 131, pp. 83–99  
+
+[2] M. Schelbergen, 2024  
+Power to the Airborne Wind Energy Performance Model  
+"""
+
+with open("README.md", "w", encoding="utf-8") as f:
+    f.write(readme_text)

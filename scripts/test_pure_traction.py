@@ -147,7 +147,6 @@ def main():
     for ws in [4, 6, 8, 10, 12]:
         wind = WindCondition(speed=float(ws), direction=0.0)
         run_case(f"{ws:>4.1f} m/s", solver, wind, base_input, base_vessel_state, rows)
-
     print("\nTEST 2 — Azimuth sign check")
     print("---------------------------")
     for az_deg in [-20, -10, 0, 10, 20]:

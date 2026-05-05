@@ -135,7 +135,7 @@ def plot_time_history(cycle, projection, heading_deg):
 
 def main():
     cluster_id = 1
-    reference_wind_speed = 8.0
+    reference_wind_speed = 16.0
 
     cycle = run_cycle(
         reference_wind_speed=reference_wind_speed,
