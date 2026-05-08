@@ -78,15 +78,17 @@ WIND_RESOURCE_PATH = PROJECT_ROOT / "data" / "wind_resource.yml"
 SIMULATION_SETTINGS_PATH = PROJECT_ROOT / "data" / "simulation_settings.yml"
 
 CSV_OUTPUT_PATH = RESULTS_DIR / "optimized_traction_heading_wind_sweep.csv"
+CSV_AUTOSAVE_PATH = RESULTS_DIR / "optimized_traction_heading_wind_sweep_autosave.csv"
+CSV_CANDIDATE_LOG_PATH = RESULTS_DIR / "optimized_traction_candidate_log.csv"
 
 
 # =============================================================================
 # Sweep settings
 # =============================================================================
 
-TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
-
-SHIP_SPEED = 5.0
+TRUE_WIND_SPEEDS = np.array([18.0], dtype=float)
+#TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
+SHIP_SPEED = 4.0
 CLUSTER_ID = 1
 TETHER_LENGTH = 500.0
 
@@ -98,7 +100,7 @@ MIRROR_RESULTS_FOR_PLOT = True
 # True  = compute only 0–180 deg, mirror 180–360 deg for polar plotting
 # False = compute full 0–360 deg, no mirroring
 
-HEADING_STEP_DEG = 15.0
+HEADING_STEP_DEG = 5.0
 
 if MIRROR_RESULTS_FOR_PLOT:
     SWEEP_HEADINGS = np.arange(0.0, 181.0, HEADING_STEP_DEG)
@@ -109,13 +111,30 @@ else:
 # Keep False for normal heading sweeps to avoid cluttering the console.
 OPTIMIZER_VERBOSE = False
 
-# Set to None to use all candidate starts.
-# For faster debugging, set e.g. MAX_CANDIDATE_STARTS = 12.
-MAX_CANDIDATE_STARTS = None
-DIAGNOSTIC_WIND_SPEED = 14.0  # choose one of TRUE_WIND_SPEEDS
+# None = use all starts. For faster testing use e.g. 20.
+MAX_CANDIDATE_STARTS = 25
+
+# Save partial results while running.
+AUTOSAVE_AFTER_EACH_CASE = True
+AUTOSAVE_CANDIDATE_LOG_AFTER_EACH_CASE = False
+
+# Diagnostic plot wind speed.
+DIAGNOSTIC_WIND_SPEED = 18.0
 PLOT_OPERATING_ANGLES = True
 
+# SLSQP settings.
+MAX_OPTIMIZER_ITERATIONS = 800
+OPTIMIZER_FTOL = 1.0e-9
+OPTIMIZER_EPS = 5.0e-4
 
+# =============================================================================
+# Diagnostic force-limit switch
+# =============================================================================
+
+USE_TETHER_FORCE_LIMIT = True
+
+# Use a plain float, not scientific notation in YAML.
+DIAGNOSTIC_TETHER_FORCE_MAX = 1000000000.0
 
 # =============================================================================
 # Optimizer settings
@@ -147,7 +166,6 @@ SCALING = np.array(
 
 FORCE_TOLERANCE = 1.0
 FORCE_SAFETY_MARGIN = 5.0
-ZERO_POWER_THRESHOLD = 10.0
 
 
 # =============================================================================
@@ -279,42 +297,6 @@ def evaluate_traction_operating_point(
     }
 
 
-def evaluate_traction_operating_point_safe(
-    solver,
-    true_wind_speed,
-    ship_speed,
-    heading_deg,
-    x_deg,
-):
-    try:
-        return evaluate_traction_operating_point(
-            solver=solver,
-            true_wind_speed=true_wind_speed,
-            ship_speed=ship_speed,
-            heading_deg=heading_deg,
-            x_deg=x_deg,
-        )
-
-    except Exception as exc:
-        return {
-            "evaluation_success": False,
-            "error_message": str(exc),
-            "azimuth_angle_deg": float(x_deg[0]),
-            "elevation_angle_deg": float(x_deg[1]),
-            "course_angle_deg": float(x_deg[2]),
-            "true_wind_speed": float(true_wind_speed),
-            "ship_speed": float(ship_speed),
-            "heading_deg": float(heading_deg),
-            "apparent_wind_speed": np.nan,
-            "apparent_wind_direction_deg": np.nan,
-            "tether_force_ground": np.nan,
-            "Fx": np.nan,
-            "Fy": np.nan,
-            "P_equiv_traction": np.nan,
-            "P_equiv_traction_kW": np.nan,
-        }
-
-
 def is_physically_feasible_result(result, tether_force_max):
     """
     Check whether a result is physically usable for this constrained problem.
@@ -348,6 +330,48 @@ def is_physically_feasible_result(result, tether_force_max):
     )
 
     return positive_surge_ok and tether_ok
+
+def add_projection_diagnostics(result):
+    """
+    Add Fx/T and projection loss angle diagnostics.
+    """
+
+    Fx = result.get("Fx", np.nan)
+    T = result.get("tether_force_ground", np.nan)
+
+    if np.isfinite(Fx) and np.isfinite(T) and T > 0.0:
+        ratio = Fx / T
+        ratio_clipped = np.clip(ratio, -1.0, 1.0)
+        projection_loss_angle_deg = np.rad2deg(np.arccos(ratio_clipped))
+    else:
+        ratio = np.nan
+        projection_loss_angle_deg = np.nan
+
+    result["Fx_over_tether_force"] = float(ratio)
+    result["projection_loss_angle_deg"] = float(projection_loss_angle_deg)
+
+    return result
+
+
+def build_force_limit_plot_label(
+    physical_tether_force_max: float,
+    optimizer_tether_force_max: float,
+) -> str:
+    """
+    Text label for plot titles showing whether the force limit is active.
+    """
+
+    if USE_TETHER_FORCE_LIMIT:
+        return (
+            f"Force limit ON: "
+            f"T ≤ {physical_tether_force_max / 1000.0:.2f} kN"
+        )
+
+    return (
+        f"Force limit OFF diagnostic: "
+        f"physical limit = {physical_tether_force_max / 1000.0:.2f} kN, "
+        f"optimizer limit = {optimizer_tether_force_max / 1000.0:.0f} kN"
+    )
 
 
 # =============================================================================
@@ -522,9 +546,9 @@ class TractionOptimizer:
             bounds=bounds_scaled,
             constraints=constraints,
             options={
-                "maxiter": 400,
-                "ftol": 1.0e-8,
-                "eps": 1.0e-3,
+                "maxiter": MAX_OPTIMIZER_ITERATIONS,
+                "ftol": OPTIMIZER_FTOL,
+                "eps": OPTIMIZER_EPS,
                 "disp": verbose,
             },
         )
@@ -591,7 +615,7 @@ class TractionOptimizer:
             ],
             dtype=float,
         )
-
+        final_result = add_projection_diagnostics(final_result)
         return final_result
 
 
@@ -723,13 +747,17 @@ def optimize_heading_with_retries(
 ):
     """
     Optimize one heading using multiple physically distinct initial guesses.
+
+    Returns:
+        best_result, candidate_log_rows
     """
 
     candidate_starts = build_candidate_starts(warm_start_deg=warm_start_deg)
 
     results = []
+    candidate_log_rows = []
 
-    for x0 in candidate_starts:
+    for candidate_index, x0 in enumerate(candidate_starts):
         optimizer = TractionOptimizer(
             solver=solver,
             true_wind_speed=true_wind_speed,
@@ -743,7 +771,17 @@ def optimize_heading_with_retries(
             verbose=OPTIMIZER_VERBOSE,
         )
 
+        result = add_projection_diagnostics(result)
         results.append(result)
+
+        candidate_log_rows.append(
+            build_candidate_log_row(
+                result=result,
+                candidate_index=candidate_index,
+                x0_deg=x0,
+                selected_best=False,
+            )
+        )
 
     feasible_results = [
         r for r in results
@@ -751,23 +789,133 @@ def optimize_heading_with_retries(
     ]
 
     if feasible_results:
-        return max(feasible_results, key=lambda r: r["P_equiv_traction"])
+        best = max(feasible_results, key=lambda r: r["P_equiv_traction"])
+    else:
+        successful = [
+            r for r in results
+            if r.get("evaluation_success", False)
+            and np.isfinite(r.get("P_equiv_traction", np.nan))
+        ]
 
-    successful = [
-        r for r in results
-        if r.get("evaluation_success", False)
-        and np.isfinite(r.get("P_equiv_traction", np.nan))
-    ]
+        if successful:
+            best = max(successful, key=lambda r: r["P_equiv_traction"])
+        else:
+            best = results[0]
 
-    if successful:
-        return max(successful, key=lambda r: r["P_equiv_traction"])
+    best_power = best.get("P_equiv_traction", np.nan)
+    best_x = best.get("x_opt_deg", np.array([np.nan, np.nan, np.nan]))
 
-    return results[0]
+    for row in candidate_log_rows:
+        same_power = np.isclose(
+            row.get("optimized_P_equiv_traction", np.nan),
+            best_power,
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+
+        same_x = (
+            np.isclose(row.get("optimized_azimuth_angle_deg", np.nan), best_x[0], atol=1.0e-6)
+            and np.isclose(row.get("optimized_elevation_angle_deg", np.nan), best_x[1], atol=1.0e-6)
+            and np.isclose(row.get("optimized_course_angle_deg", np.nan), best_x[2], atol=1.0e-6)
+        )
+
+        row["selected_best"] = bool(same_power and same_x)
+
+    return best, candidate_log_rows
 
 
 # =============================================================================
 # Output rows
 # =============================================================================
+def build_candidate_log_row(
+    result,
+    candidate_index,
+    x0_deg,
+    selected_best=False,
+):
+    """
+    Save one row per multistart candidate.
+    """
+
+    return {
+        "true_wind_speed": result.get("true_wind_speed", np.nan),
+        "ship_speed": result.get("ship_speed", np.nan),
+        "heading_deg": result.get("heading_deg", np.nan),
+        "candidate_index": candidate_index,
+        "start_azimuth_angle_deg": float(x0_deg[0]),
+        "start_elevation_angle_deg": float(x0_deg[1]),
+        "start_course_angle_deg": float(x0_deg[2]),
+        "evaluation_success": result.get("evaluation_success", False),
+        "optimizer_success": result.get("optimizer_success", False),
+        "accepted_result": result.get("accepted_result", False),
+        "accepted_despite_optimizer_message": result.get(
+            "accepted_despite_optimizer_message",
+            False,
+        ),
+        "optimizer_message": result.get("optimizer_message", ""),
+        "optimized_azimuth_angle_deg": result.get("azimuth_angle_deg", np.nan),
+        "optimized_elevation_angle_deg": result.get("elevation_angle_deg", np.nan),
+        "optimized_course_angle_deg": result.get("course_angle_deg", np.nan),
+        "optimized_Fx": result.get("Fx", np.nan),
+        "optimized_Fy": result.get("Fy", np.nan),
+        "optimized_tether_force_ground": result.get("tether_force_ground", np.nan),
+        "Fx_over_tether_force": result.get("Fx_over_tether_force", np.nan),
+        "projection_loss_angle_deg": result.get("projection_loss_angle_deg", np.nan),
+        "constraint_active": result.get("constraint_active", False),
+        "tether_constraint_violation": result.get("tether_constraint_violation", np.nan),
+        "optimizer_tether_constraint_violation": result.get(
+            "optimizer_tether_constraint_violation",
+            np.nan,
+        ),
+        "optimized_P_equiv_traction": result.get("P_equiv_traction", np.nan),
+        "optimized_P_equiv_traction_kW": result.get("P_equiv_traction_kW", np.nan),
+        "selected_best": selected_best,
+    }
+
+
+def save_candidate_log_to_csv(rows, output_path, quiet=False):
+    if not rows:
+        return
+
+    fieldnames = [
+        "true_wind_speed",
+        "ship_speed",
+        "heading_deg",
+        "candidate_index",
+        "start_azimuth_angle_deg",
+        "start_elevation_angle_deg",
+        "start_course_angle_deg",
+        "evaluation_success",
+        "optimizer_success",
+        "accepted_result",
+        "accepted_despite_optimizer_message",
+        "optimizer_message",
+        "optimized_azimuth_angle_deg",
+        "optimized_elevation_angle_deg",
+        "optimized_course_angle_deg",
+        "optimized_Fx",
+        "optimized_Fy",
+        "optimized_tether_force_ground",
+        "Fx_over_tether_force",
+        "projection_loss_angle_deg",
+        "constraint_active",
+        "tether_constraint_violation",
+        "optimizer_tether_constraint_violation",
+        "optimized_P_equiv_traction",
+        "optimized_P_equiv_traction_kW",
+        "selected_best",
+    ]
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    if not quiet:
+        print(f"\nSaved traction candidate log to:\n  {output_path}")
+        
 
 def build_output_row(optimized_result, tether_force_max):
     return {
@@ -790,6 +938,8 @@ def build_output_row(optimized_result, tether_force_max):
         "optimized_Fx": optimized_result["Fx"],
         "optimized_Fy": optimized_result["Fy"],
         "optimized_tether_force_ground": optimized_result["tether_force_ground"],
+        "Fx_over_tether_force": optimized_result.get("Fx_over_tether_force", np.nan),
+        "projection_loss_angle_deg": optimized_result.get("projection_loss_angle_deg", np.nan),
         "tether_force_max": tether_force_max,
         "tether_force_effective_limit": tether_force_max - FORCE_SAFETY_MARGIN,
         "tether_constraint_violation": optimized_result["tether_constraint_violation"],
@@ -825,10 +975,22 @@ def print_progress(
         P_kw = row["optimized_P_equiv_traction"] / 1000.0
         Fx = row["optimized_Fx"]
         T = row["optimized_tether_force_ground"]
+
+        az = row["optimized_azimuth_angle_deg"]
+        beta = row["optimized_elevation_angle_deg"]
+        course = row["optimized_course_angle_deg"]
+
+        Fx_over_T = row.get("Fx_over_tether_force", np.nan)
+        proj_loss = row.get("projection_loss_angle_deg", np.nan)
     else:
         P_kw = np.nan
         Fx = np.nan
         T = np.nan
+        az = np.nan
+        beta = np.nan
+        course = np.nan
+        Fx_over_T = np.nan
+        proj_loss = np.nan
 
     best_kw = best_power / 1000.0 if np.isfinite(best_power) else np.nan
 
@@ -841,10 +1003,15 @@ def print_progress(
         f"Peq={P_kw:9.3f} kW | "
         f"Fx={Fx:9.1f} N | "
         f"T={T:9.1f} N | "
+        f"az={az:7.2f}° | "
+        f"β={beta:6.2f}° | "
+        f"course={course:8.2f}° | "
+        f"Fx/T={Fx_over_T:6.3f} | "
+        f"loss={proj_loss:6.2f}° | "
         f"best={best_kw:9.3f} kW"
     )
 
-    sys.stdout.write("\r" + msg.ljust(180))
+    sys.stdout.write("\r" + msg.ljust(260))
     sys.stdout.flush()
 
 
@@ -854,8 +1021,12 @@ def run_heading_sweep(
     ship_speed,
     headings,
     tether_force_max,
+    autosave_prefix_rows=None,
+    autosave_prefix_candidate_rows=None,
 ):
     rows = []
+    candidate_rows = []
+
     warm_start_deg = INITIAL_GUESS_DEG.copy()
 
     accepted_count = 0
@@ -865,7 +1036,7 @@ def run_heading_sweep(
     total = len(headings)
 
     for i, heading_deg in enumerate(headings, start=1):
-        optimized_result = optimize_heading_with_retries(
+        optimized_result, case_candidate_rows = optimize_heading_with_retries(
             solver=solver,
             true_wind_speed=float(true_wind_speed),
             ship_speed=float(ship_speed),
@@ -883,12 +1054,29 @@ def run_heading_sweep(
         )
 
         rows.append(row)
+        candidate_rows.extend(case_candidate_rows)
 
         if row["accepted_result"]:
             accepted_count += 1
             best_power = max(best_power, row["optimized_P_equiv_traction"])
         else:
             failed_count += 1
+
+        if AUTOSAVE_AFTER_EACH_CASE:
+            prefix_rows = autosave_prefix_rows if autosave_prefix_rows is not None else []
+            save_results_to_csv(prefix_rows + rows, CSV_AUTOSAVE_PATH, quiet=True)
+
+            prefix_candidate_rows = (
+                autosave_prefix_candidate_rows
+                if autosave_prefix_candidate_rows is not None
+                else []
+            )
+            if AUTOSAVE_CANDIDATE_LOG_AFTER_EACH_CASE:
+                save_candidate_log_to_csv(
+                    prefix_candidate_rows + candidate_rows,
+                    CSV_CANDIDATE_LOG_PATH,
+                    quiet=True,
+            )
 
         print_progress(
             wind_speed=true_wind_speed,
@@ -902,7 +1090,7 @@ def run_heading_sweep(
         )
 
     print("")
-    return rows
+    return rows, candidate_rows
 
 
 def run_wind_heading_sweep(
@@ -913,6 +1101,7 @@ def run_wind_heading_sweep(
     tether_force_max,
 ):
     all_rows = []
+    all_candidate_rows = []
 
     for true_wind_speed in true_wind_speeds:
         print(
@@ -921,24 +1110,27 @@ def run_wind_heading_sweep(
             f"ship speed = {ship_speed:.1f} m/s"
         )
 
-        rows = run_heading_sweep(
+        rows, candidate_rows = run_heading_sweep(
             solver=solver,
             true_wind_speed=float(true_wind_speed),
             ship_speed=ship_speed,
             headings=headings,
             tether_force_max=tether_force_max,
+            autosave_prefix_rows=all_rows,
+            autosave_prefix_candidate_rows=all_candidate_rows,
         )
 
         all_rows.extend(rows)
+        all_candidate_rows.extend(candidate_rows)
 
-    return all_rows
+    return all_rows, all_candidate_rows
 
 
 # =============================================================================
 # CSV
 # =============================================================================
 
-def save_results_to_csv(rows, output_path):
+def save_results_to_csv(rows, output_path, quiet=False):
     fieldnames = [
         "true_wind_speed",
         "ship_speed",
@@ -956,6 +1148,8 @@ def save_results_to_csv(rows, output_path):
         "optimized_Fx",
         "optimized_Fy",
         "optimized_tether_force_ground",
+        "Fx_over_tether_force",
+        "projection_loss_angle_deg",
         "tether_force_max",
         "tether_force_effective_limit",
         "tether_constraint_violation",
@@ -975,8 +1169,8 @@ def save_results_to_csv(rows, output_path):
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
-    print(f"\nSaved optimized traction wind-heading sweep to:\n  {output_path}")
-
+    if not quiet:
+        print(f"\nSaved optimized traction wind-heading sweep to:\n  {output_path}")
 
 # =============================================================================
 # Summary
@@ -1015,6 +1209,45 @@ def print_compact_summary(rows):
                 f"best Peq=nan"
             )
 
+def print_selected_solution_table(rows, target_wind_speed=DIAGNOSTIC_WIND_SPEED):
+    """
+    Print selected optimized traction variables and projection diagnostics.
+    """
+
+    selected = [
+        r for r in rows
+        if np.isclose(float(r["true_wind_speed"]), target_wind_speed)
+        and r.get("accepted_result", False)
+    ]
+
+    if not selected:
+        print(f"\nNo accepted rows found for Vw={target_wind_speed:.1f} m/s.")
+        return
+
+    selected = sorted(selected, key=lambda r: r["heading_deg"])
+
+    print("\nSELECTED TRACTION SOLUTIONS")
+    print("---------------------------")
+    print(
+        " heading |   Peq |     Fx |      T |     az |   beta |   course |  Fx/T | loss"
+    )
+    print(
+        "   [deg] |  [kW] |    [N] |    [N] |  [deg] |  [deg] |    [deg] |   [-] | [deg]"
+    )
+    print("-" * 92)
+
+    for r in selected:
+        print(
+            f"{r['heading_deg']:8.1f} | "
+            f"{r['optimized_P_equiv_traction_kW']:6.2f} | "
+            f"{r['optimized_Fx']:6.0f} | "
+            f"{r['optimized_tether_force_ground']:6.0f} | "
+            f"{r['optimized_azimuth_angle_deg']:6.1f} | "
+            f"{r['optimized_elevation_angle_deg']:6.1f} | "
+            f"{r['optimized_course_angle_deg']:8.1f} | "
+            f"{r.get('Fx_over_tether_force', np.nan):5.3f} | "
+            f"{r.get('projection_loss_angle_deg', np.nan):5.1f}"
+        )
 
 # =============================================================================
 # Plotting
@@ -1065,7 +1298,7 @@ def make_rows_for_polar_plot(rows):
 
     return plot_rows
 
-def plot_polar_positive_p_equiv_traction(rows):
+def plot_polar_positive_p_equiv_traction(rows, force_limit_text=""):
     plot_rows = make_rows_for_polar_plot(rows)
 
     if not plot_rows:
@@ -1101,7 +1334,7 @@ def plot_polar_positive_p_equiv_traction(rows):
                     r.get("accepted_result", False)
                     and np.isfinite(r.get("optimized_P_equiv_traction", np.nan))
                 )
-                else 0.0
+                else np.nan
                 for r in rows_sorted
             ],
             dtype=float,
@@ -1112,7 +1345,8 @@ def plot_polar_positive_p_equiv_traction(rows):
 
         theta_closed, radius_closed = close_polar_curve(theta, radius)
 
-        max_radius = max(max_radius, np.nanmax(radius_closed))
+        if np.any(np.isfinite(radius_closed)):
+            max_radius = max(max_radius, float(np.nanmax(radius_closed)))
 
         ax.plot(
             theta_closed,
@@ -1136,6 +1370,7 @@ def plot_polar_positive_p_equiv_traction(rows):
     ax.set_title(
         f"Positive equivalent traction power\n"
         f"Ship speed = {SHIP_SPEED:.1f} m/s\n"
+        f"{force_limit_text}\n"
         f"{mirror_text}",
         pad=25,
     )
@@ -1158,7 +1393,7 @@ def plot_polar_positive_p_equiv_traction(rows):
 
     
 
-def plot_optimized_operating_angles(rows):
+def plot_optimized_operating_angles(rows, force_limit_text=""):
     """
     Plot optimized azimuth, elevation, and course angle versus ship heading.
 
@@ -1240,7 +1475,8 @@ def plot_optimized_operating_angles(rows):
     plt.title(
         f"Optimized traction operating angles\n"
         f"True wind = {DIAGNOSTIC_WIND_SPEED:.1f} m/s, "
-        f"ship speed = {SHIP_SPEED:.1f} m/s"
+        f"ship speed = {SHIP_SPEED:.1f} m/s\n"
+        f"{force_limit_text}"
     )
 
     plt.legend()
@@ -1268,8 +1504,17 @@ def main():
         steady_state_config=constructor.simulation_settings.get("steady_state"),
     )
 
-    tether_force_max = constructor.sys_props.tether_force_max_limit
+    physical_tether_force_max = float(constructor.sys_props.tether_force_max_limit)
 
+    if USE_TETHER_FORCE_LIMIT:
+        tether_force_max = physical_tether_force_max
+    else:
+        tether_force_max = DIAGNOSTIC_TETHER_FORCE_MAX
+
+    force_limit_plot_text = build_force_limit_plot_label(
+        physical_tether_force_max=physical_tether_force_max,
+        optimizer_tether_force_max=tether_force_max,
+    )
     print("\nCONSTRAINED TRACTION OPTIMIZED WIND-HEADING SWEEP")
     print("-------------------------------------------------")
     print(f"True wind speeds      : {TRUE_WIND_SPEEDS}")
@@ -1281,14 +1526,16 @@ def main():
     print(f"Heading step          : {SWEEP_HEADINGS[1] - SWEEP_HEADINGS[0]:.3f} deg")
     print(f"Mirrored for plot     : {MIRROR_RESULTS_FOR_PLOT}")
     print(f"Candidate starts      : {'all' if MAX_CANDIDATE_STARTS is None else MAX_CANDIDATE_STARTS}")
-
+    print(f"Physical tether force max : {physical_tether_force_max:.3f} N")
+    print(f"Optimizer tether limit    : {tether_force_max:.3f} N")
+    print(f"Force limit active        : {USE_TETHER_FORCE_LIMIT}")
     print("\nObjective")
     print("---------")
     print("Maximize P_equiv_traction = Fx_ship * V_ship")
     print("Positive Fx_ship helps propulsion.")
     print("The polar plot radius is P_equiv_traction [kW], not Fx.")
 
-    rows = run_wind_heading_sweep(
+    rows, candidate_rows = run_wind_heading_sweep(
         solver=solver,
         true_wind_speeds=TRUE_WIND_SPEEDS,
         ship_speed=SHIP_SPEED,
@@ -1297,11 +1544,20 @@ def main():
     )
 
     save_results_to_csv(rows, CSV_OUTPUT_PATH)
+    save_candidate_log_to_csv(candidate_rows, CSV_CANDIDATE_LOG_PATH)
 
     print_compact_summary(rows)
+    print_selected_solution_table(rows, target_wind_speed=DIAGNOSTIC_WIND_SPEED)
 
-    plot_optimized_operating_angles(rows)
-    plot_polar_positive_p_equiv_traction(rows)
+    plot_optimized_operating_angles(
+        rows,
+        force_limit_text=force_limit_plot_text,
+    )
+
+    plot_polar_positive_p_equiv_traction(
+        rows,
+        force_limit_text=force_limit_plot_text,
+    )
     plt.show()
 
 if __name__ == "__main__":

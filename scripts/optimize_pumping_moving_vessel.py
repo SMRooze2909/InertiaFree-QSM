@@ -94,8 +94,8 @@ SHIP_SPEED = 4.0
 CLUSTER_ID = 1
 
 # Use 2 or 3 wind speeds for debugging/plotting.
-TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
-
+TRUE_WIND_SPEEDS = np.array([18.0], dtype=float)
+#TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
 # =============================================================================
 # Mirroring switch (RUNTIME SAVING PURPOSES)
 # =============================================================================
