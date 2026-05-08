@@ -17,6 +17,10 @@ Main additions:
 - Ship-frame force projection
 - Equivalent propulsion-power metrics
 - Heading-dependent operational maps
+- Traction mode optimization
+- Pumping mode optimization with vessel-force correction
+- Traction versus pumping comparison scripts
+- Phase-based result storage and verification outputs
 
 
 ADDED FILES AND SCRIPTS
@@ -24,70 +28,125 @@ ADDED FILES AND SCRIPTS
 
 scripts/
 
-test_pumping_with_apparent_wind.py  
-Runs the pumping-cycle model using apparent wind from a moving vessel.  
+test_pumping_with_apparent_wind.py
+Runs the pumping-cycle model using apparent wind from a moving vessel.
 Projects cycle forces into ship axes and computes equivalent propulsion benefit.
 
-test_traction_with_apparent_wind.py  
-Evaluates traction mode under apparent wind conditions.  
-Includes both constrained and unconstrained operation to diagnose force behavior.
+test_traction_with_apparent_wind.py
+Evaluates traction mode under apparent wind conditions.
+Used as an early verification script before the optimized traction sweep was added.
 
-pumping_moving_vessel_matrix.py  
-Runs large parameter sweeps over:
-- wind speed
-- ship speed
-- heading  
-Outputs CSV files and performs physical consistency checks.
+test_pumping_force_projection.py
+Standalone verification of force projection logic from QSM frame to global and ship frame.
 
-traction_moving_vessel_matrix.py  
-Same as pumping matrix, but for traction mode.  
-Includes unconstrained solver option to investigate force envelope and constraint effects.
-
-test_pumping_force_projection.py  
-Standalone verification of force projection logic from QSM frame to ship frame.
-
-test_pure_traction.py  
+test_pure_traction.py
 Baseline traction solver test without vessel coupling.
 
-test_vessel_coupling.py  
+test_vessel_coupling.py
 Validation script for apparent wind computation and vessel motion coupling.
+
+optimize_traction_moving_vessel.py
+Main optimized traction-mode heading-sweep script for the moving-vessel model.
+For each true wind speed and ship heading, it:
+- computes the apparent wind from prescribed ship motion
+- runs the traction solver in the apparent-wind-aligned QSM frame
+- optimizes azimuth angle, elevation angle, and course angle
+- enforces positive surge force and tether-force constraints
+- computes P_equiv_traction = Fx_ship * V_ship
+- saves CSV output and diagnostic plots
+
+The script is used for Phase 2: Traction mode verification.
+It includes diagnostics for:
+- tether-force constraint activity
+- Fx/T projection ratio
+- projection loss angle
+- apparent wind speed and angle
+- optimized operating angles
+- constrained and no-force-limit diagnostic runs
+
+optimize_pumping_moving_vessel.py
+Main optimized pumping-mode heading-sweep script for the moving-vessel model.
+For each true wind speed and ship heading, it:
+- computes the apparent wind from prescribed ship motion
+- runs the QSM pumping-cycle optimizer in the apparent-wind-aligned frame
+- extracts the cycle force history
+- projects the cycle forces into the ship frame
+- computes cycle-averaged Fx_avg and Fy_avg
+- maximizes P_equiv_pumping = P_cycle + Fx_avg * V_ship
+- saves CSV output and diagnostic plots
+
+The script is used for Phase 3: Pumping mode verification.
+It includes diagnostics for:
+- cycle power
+- propulsion-equivalent force contribution
+- propulsion penalty
+- tether-force constraint activity
+- stroke length and stroke fraction
+- optimized reeling speeds and elevation variables
+- apparent wind speed and angle
+
+operationalmap.py
+Comparison and operational-map script for traction and pumping results.
+It reads the optimized traction and pumping CSV files and compares both modes on the same equivalent-power basis.
+
+The script is used after Phase 2 and Phase 3 to support Phase 4 and later comparison work.
+It can be used to:
+- overlay traction and pumping polar plots
+- compare P_equiv_traction and P_equiv_pumping
+- identify which mode gives the highest equivalent benefit
+- create mode-selection maps over wind speed and heading
+- support later switching-boundary and operational-strategy analysis
 
 
 src/inertiafree_qsm/
 
-coordinate_transforms.py  
+coordinate_transforms.py
 Core transformation logic:
-- QSM frame -> global frame -> ship frame  
-Ensures physically consistent mapping of tether forces.
+- QSM frame -> global frame -> ship frame
 
-vessel_coupling.py  
+Ensures physically consistent mapping of tether forces from the apparent-wind-aligned kite frame to the vessel axes.
+
+vessel_coupling.py
 Implements:
 - true wind definition
-- vessel motion
+- vessel motion definition
 - apparent wind computation
 
-force_projection.py  
-Utilities for projecting distributed and point forces into model DOFs or vessel axes.
+Currently used for prescribed vessel motion. Later this module can be extended or connected to a vessel equilibrium model with leeway.
 
-operating_point.py  
+force_projection.py
+Utilities for projecting forces into vessel axes or other model coordinate systems.
+
+operating_point.py
 Defines operating-point structures for traction calculations:
 - vessel state
 - wind condition
 
-pure_traction.py  
+pure_traction.py
 Standalone quasi-steady traction solver:
 - computes tether force
-- computes resulting vessel forces
+- computes traction operating point
+- supports moving-vessel force projection through the surrounding coupling scripts
 
 
 MOVING-VESSEL COUPLING
 ----------------------
 
-The vessel motion is included through the apparent wind:
+The vessel is currently introduced as a prescribed moving ground station.
+The ship speed and heading are imposed.
+
+The apparent wind is computed from the true wind vector and the vessel velocity vector:
 
     V_app = V_true - V_ship
 
 The QSM model is evaluated using the apparent wind speed and direction.
+The QSM frame is aligned with the apparent wind direction.
+
+The current coupling is one-way:
+
+    prescribed ship motion -> apparent wind -> kite model -> ship-frame forces
+
+The vessel response is not yet solved.
 
 
 COORDINATE SYSTEM CONVENTION
@@ -100,116 +159,190 @@ Transformation chain:
     QSM frame -> global frame -> ship frame
 
 Key assumptions:
-- QSM azimuth = kite position direction
-- tether force acts from vessel toward kite
+- QSM azimuth angle defines the kite position direction
+- tether force on the vessel acts from the vessel toward the kite
 - ship axes:
-    Fx = surge (forward)
-    Fy = sway
-
-
-PUMPING MODE
-------------
-
-Outputs:
-- cycle power: P_cycle
-- cycle-averaged forces: Fx_avg, Fy_avg
-
-Equivalent propulsion benefit:
-
-    P_equiv_pumping = P_cycle + Fx_avg * V_ship
+    Fx = surge force, positive forward
+    Fy = sway force, positive lateral
 
 
 TRACTION MODE
 -------------
 
+Traction mode is represented by one optimized quasi-steady operating point.
+
 Outputs:
 - tether force
-- Fx (surge)
-- Fy (sway)
+- Fx_ship
+- Fy_ship
+- optimized azimuth angle
+- optimized elevation angle
+- optimized course angle
 
 Equivalent propulsion benefit:
 
-    P_equiv_traction = Fx * V_ship
+    P_equiv_traction = Fx_ship * V_ship
+
+Current traction optimization variables:
+
+    x = [azimuth_angle, elevation_angle, course_angle]
+
+Main constraints:
+- Fx_ship >= 0
+- tether_force <= tether_force_max
+
+Current depowering strategy:
+- traction mode uses one powered aerodynamic state
+- CL, CD, and AoA are not directly optimized
+- when the tether force limit is active, the optimizer geometrically depowers the kite by changing azimuth, elevation, and course angle
+- this can reduce Fx/T and increase projection loss
+
+A future extension is to include explicit aerodynamic depowering:
+
+    x = [azimuth_angle, elevation_angle, course_angle, depower]
+
+with:
+
+    CL = CL(AoA)
+    CD = CD(AoA)
 
 
-UNCONSTRAINED TRACTION DIAGNOSTIC
---------------------------------
+PUMPING MODE
+------------
 
-If tether force exceeds limit:
-- constraint is temporarily disabled
-- solution is still computed
+Pumping mode is represented by an optimized quasi-steady pumping cycle.
 
-Purpose:
-- verify coordinate system correctness
-- understand force envelope
+Outputs:
+- cycle power: P_cycle
+- cycle-averaged forces: Fx_avg, Fy_avg
+- mean and maximum tether force
+- optimized reeling speeds
+- optimized stroke fractions
+- optimized elevation variables
 
-These results are NOT physically feasible.
+Equivalent propulsion benefit:
+
+    P_equiv_pumping = P_cycle + Fx_avg * V_ship
+
+Positive Fx_avg contributes to propulsion.
+Negative Fx_avg creates a propulsion penalty.
+
+Current pumping-cycle power is mechanical QSM cycle power.
+No drivetrain, generator, electrical, or propulsion-reuse efficiency is included yet.
+
+A future placeholder correction can be introduced as:
+
+    P_equiv_pumping_eff = eta_use * P_cycle + Fx_avg * V_ship
+
+
+OPERATIONAL MAP / MODE COMPARISON
+---------------------------------
+
+The operational comparison reads the optimized traction and pumping results and compares both modes on the same metric.
+
+Traction:
+
+    P_equiv_traction = Fx_ship * V_ship
+
+Pumping:
+
+    P_equiv_pumping = P_cycle + Fx_avg * V_ship
+
+The comparison can be used to identify:
+- traction-favourable regions
+- pumping-favourable regions
+- zero-benefit or infeasible regions
+- switching boundaries between modes
+
+At the current stage, this is still based on prescribed ship speed.
+It is not yet a full vessel-response or fuel-saving calculation.
+
 
 
 CURRENT MODELLING STATUS
 ------------------------
 
 Implemented:
-- apparent wind coupling
-- coordinate transformations
-- pumping cycle simulation
+- moving-vessel apparent wind coupling
+- QSM-to-global-to-ship force transformations
 - traction force evaluation
-- equivalent propulsion metrics
-- heading sweeps
-- matrix simulations with verification checks
+- constrained traction optimization
+- no-force-limit traction diagnostic
+- pumping-cycle simulation with moving-vessel apparent wind
+- cycle-averaged ship-frame force projection
+- equivalent propulsion metrics for traction and pumping
+- heading sweeps over true wind speed and ship heading
+- phase-based CSV and plot output
+- traction versus pumping comparison on a common equivalent-power basis
 
 Not yet implemented:
-- vessel equilibrium (PPP)
+- full vessel equilibrium / PPP coupling
 - leeway angle
-- resistance model
+- hydrodynamic resistance and side-force model
 - propulsion system model
-- traction optimization
-- depowering control
-- economic analysis
+- rudder or yaw-equilibrium model
+- explicit aerodynamic depowering in traction mode
+- drivetrain/generator/propulsion-reuse efficiency correction for pumping
+- economic analysis based on route or wind statistics
 
 
 NEXT STEPS
 ----------
 
-1) TRACTION OPTIMIZATION  
-Optimize:
-- azimuth angle
-- elevation angle
-- course angle  
-Objective:
-    maximize Fx or P_equiv_traction  
-Constraint:
-    tether_force <= limit
+1) POWER AND EFFICIENCY CHECK
+Add a placeholder efficiency factor for pumping power:
 
-2) CONSTRAINED TRACTION MODEL  
-Replace unconstrained solver with:
-- depowering strategy OR
-- infeasible masking
+    P_equiv_pumping_eff = eta_use * P_cycle + Fx_avg * V_ship
 
-3) FULL VESSEL COUPLING  
+Use this to test sensitivity to drivetrain, generator, electrical, and propulsion-reuse efficiency.
+
+2) EXPLICIT TRACTION DEPOWERING
+Extend the traction optimization variables with a depowering or AoA variable:
+
+    x = [azimuth_angle, elevation_angle, course_angle, depower]
+
+Map depower to aerodynamic coefficients:
+
+    CL = CL(AoA)
+    CD = CD(AoA)
+
+This separates aerodynamic depowering from geometric depowering.
+
+3) FULL VESSEL COUPLING
+Replace prescribed vessel speed with a vessel equilibrium model.
+
 Couple:
-    kite forces + resistance + propulsion  
-Solve full equilibrium
 
-4) UNIFIED MODE COMPARISON  
-Compare traction and pumping using:
-    equivalent propulsion benefit
+    kite forces + hydrodynamic forces + propulsion forces
 
-5) ECONOMIC EVALUATION  
-Combine with wind statistics to compute:
+Solve for:
+- ship speed
+- leeway angle
+- required propulsion power
+- possibly rudder force or yaw equilibrium
+
+4) UNIFIED MODE COMPARISON
+Compare traction and pumping using propulsion-power reduction from the coupled vessel model, rather than only prescribed-speed equivalent power.
+
+5) OPERATIONAL STRATEGY
+Use the coupled results to define mode-selection boundaries between traction and pumping.
+
+6) ECONOMIC EVALUATION
+Combine operational maps with wind statistics or route data to estimate:
+- propulsion energy reduction
 - fuel savings
-- system value
+- value of dual-mode operation
 
 
 REFERENCES
 ----------
 
-[1] R. van der Vlugt et al., 2019  
-Quasi-Steady Model of a Pumping Kite Power System  
-Renewable Energy 131, pp. 83–99  
+[1] R. van der Vlugt et al., 2019
+Quasi-Steady Model of a Pumping Kite Power System
+Renewable Energy 131, pp. 83-99
 
-[2] M. Schelbergen, 2024  
-Power to the Airborne Wind Energy Performance Model  
+[2] M. Schelbergen, 2024
+Power to the Airborne Wind Energy Performance Model
 """
 
 with open("README.md", "w", encoding="utf-8") as f:

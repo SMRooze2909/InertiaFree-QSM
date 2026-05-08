@@ -94,7 +94,7 @@ SHIP_SPEED = 4.0
 CLUSTER_ID = 1
 
 # Use 2 or 3 wind speeds for debugging/plotting.
-TRUE_WIND_SPEEDS = np.array([18.0], dtype=float)
+TRUE_WIND_SPEEDS = np.array([6,8,10,12,14,16,18,20], dtype=float)
 #TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
 # =============================================================================
 # Mirroring switch (RUNTIME SAVING PURPOSES)
@@ -104,7 +104,7 @@ MIRROR_RESULTS_FOR_PLOT = True
 # True  = compute only 0–180 deg, mirror 180–360 deg for polar plotting 
 # False = compute full 0–360 deg, no mirroring
 
-HEADING_STEP_DEG = 15.0
+HEADING_STEP_DEG = 5.0
 
 if MIRROR_RESULTS_FOR_PLOT:
     SWEEP_HEADINGS = np.arange(0.0, 181.0, HEADING_STEP_DEG)
