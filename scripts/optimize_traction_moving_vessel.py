@@ -36,7 +36,7 @@ Plotting:
 import sys
 from pathlib import Path
 import csv
-
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import optimize as op
@@ -100,7 +100,7 @@ MIRROR_RESULTS_FOR_PLOT = True
 # True  = compute only 0–180 deg, mirror 180–360 deg for polar plotting
 # False = compute full 0–360 deg, no mirroring
 
-HEADING_STEP_DEG = 5.0
+HEADING_STEP_DEG = 15.0
 
 if MIRROR_RESULTS_FOR_PLOT:
     SWEEP_HEADINGS = np.arange(0.0, 181.0, HEADING_STEP_DEG)
@@ -373,6 +373,10 @@ def build_force_limit_plot_label(
         f"optimizer limit = {optimizer_tether_force_max / 1000.0:.0f} kN"
     )
 
+def format_s(value_s):
+    if not np.isfinite(value_s):
+        return "   nan"
+    return f"{value_s:6.1f}"
 
 # =============================================================================
 # Optimizer
@@ -752,12 +756,17 @@ def optimize_heading_with_retries(
         best_result, candidate_log_rows
     """
 
+    case_start_time = time.perf_counter()
+    candidate_runtimes = []
+
     candidate_starts = build_candidate_starts(warm_start_deg=warm_start_deg)
 
     results = []
     candidate_log_rows = []
 
     for candidate_index, x0 in enumerate(candidate_starts):
+        candidate_start_time = time.perf_counter()
+
         optimizer = TractionOptimizer(
             solver=solver,
             true_wind_speed=true_wind_speed,
@@ -771,7 +780,14 @@ def optimize_heading_with_retries(
             verbose=OPTIMIZER_VERBOSE,
         )
 
+        candidate_runtime_s = time.perf_counter() - candidate_start_time
+        candidate_runtimes.append(float(candidate_runtime_s))
+
         result = add_projection_diagnostics(result)
+
+        result["candidate_index"] = int(candidate_index)
+        result["candidate_runtime_s"] = float(candidate_runtime_s)
+
         results.append(result)
 
         candidate_log_rows.append(
@@ -782,6 +798,25 @@ def optimize_heading_with_retries(
                 selected_best=False,
             )
         )
+
+    case_runtime_s = time.perf_counter() - case_start_time
+
+    max_candidate_runtime_s = (
+        float(max(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+    mean_candidate_runtime_s = (
+        float(np.mean(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+    sum_candidate_runtime_s = (
+        float(np.sum(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+
+    for r in results:
+        r["case_runtime_s"] = float(case_runtime_s)
+        r["n_candidates_tried"] = int(len(results))
+        r["max_candidate_runtime_s"] = max_candidate_runtime_s
+        r["mean_candidate_runtime_s"] = mean_candidate_runtime_s
+        r["sum_candidate_runtime_s"] = sum_candidate_runtime_s
 
     feasible_results = [
         r for r in results
@@ -814,12 +849,37 @@ def optimize_heading_with_retries(
         )
 
         same_x = (
-            np.isclose(row.get("optimized_azimuth_angle_deg", np.nan), best_x[0], atol=1.0e-6)
-            and np.isclose(row.get("optimized_elevation_angle_deg", np.nan), best_x[1], atol=1.0e-6)
-            and np.isclose(row.get("optimized_course_angle_deg", np.nan), best_x[2], atol=1.0e-6)
+            np.isclose(
+                row.get("optimized_azimuth_angle_deg", np.nan),
+                best_x[0],
+                atol=1.0e-6,
+            )
+            and np.isclose(
+                row.get("optimized_elevation_angle_deg", np.nan),
+                best_x[1],
+                atol=1.0e-6,
+            )
+            and np.isclose(
+                row.get("optimized_course_angle_deg", np.nan),
+                best_x[2],
+                atol=1.0e-6,
+            )
         )
 
         row["selected_best"] = bool(same_power and same_x)
+
+    selected_candidate_index = int(best.get("candidate_index", -1))
+    selected_candidate_runtime_s = float(best.get("candidate_runtime_s", np.nan))
+
+    best["selected_candidate_index"] = selected_candidate_index
+    best["selected_candidate_runtime_s"] = selected_candidate_runtime_s
+
+    for row in candidate_log_rows:
+        row["case_runtime_s"] = float(case_runtime_s)
+        row["n_candidates_tried"] = int(len(results))
+        row["max_candidate_runtime_s"] = max_candidate_runtime_s
+        row["mean_candidate_runtime_s"] = mean_candidate_runtime_s
+        row["sum_candidate_runtime_s"] = sum_candidate_runtime_s
 
     return best, candidate_log_rows
 
@@ -842,6 +902,13 @@ def build_candidate_log_row(
         "ship_speed": result.get("ship_speed", np.nan),
         "heading_deg": result.get("heading_deg", np.nan),
         "candidate_index": candidate_index,
+        "selected_best": selected_best,
+        "candidate_runtime_s": result.get("candidate_runtime_s", np.nan),
+        "case_runtime_s": result.get("case_runtime_s", np.nan),
+        "n_candidates_tried": result.get("n_candidates_tried", np.nan),
+        "max_candidate_runtime_s": result.get("max_candidate_runtime_s", np.nan),
+        "mean_candidate_runtime_s": result.get("mean_candidate_runtime_s", np.nan),
+        "sum_candidate_runtime_s": result.get("sum_candidate_runtime_s", np.nan),
         "start_azimuth_angle_deg": float(x0_deg[0]),
         "start_elevation_angle_deg": float(x0_deg[1]),
         "start_course_angle_deg": float(x0_deg[2]),
@@ -869,9 +936,7 @@ def build_candidate_log_row(
         ),
         "optimized_P_equiv_traction": result.get("P_equiv_traction", np.nan),
         "optimized_P_equiv_traction_kW": result.get("P_equiv_traction_kW", np.nan),
-        "selected_best": selected_best,
     }
-
 
 def save_candidate_log_to_csv(rows, output_path, quiet=False):
     if not rows:
@@ -932,6 +997,28 @@ def build_output_row(optimized_result, tether_force_max):
             False,
         ),
         "optimizer_message": optimized_result["optimizer_message"],
+        "case_runtime_s": optimized_result.get("case_runtime_s", np.nan),
+        "n_candidates_tried": optimized_result.get("n_candidates_tried", np.nan),
+        "selected_candidate_index": optimized_result.get(
+            "selected_candidate_index",
+            np.nan,
+        ),
+        "selected_candidate_runtime_s": optimized_result.get(
+            "selected_candidate_runtime_s",
+            np.nan,
+        ),
+        "max_candidate_runtime_s": optimized_result.get(
+            "max_candidate_runtime_s",
+            np.nan,
+        ),
+        "mean_candidate_runtime_s": optimized_result.get(
+            "mean_candidate_runtime_s",
+            np.nan,
+        ),
+        "sum_candidate_runtime_s": optimized_result.get(
+            "sum_candidate_runtime_s",
+            np.nan,
+        ),
         "optimized_azimuth_angle_deg": optimized_result["azimuth_angle_deg"],
         "optimized_elevation_angle_deg": optimized_result["elevation_angle_deg"],
         "optimized_course_angle_deg": optimized_result["course_angle_deg"],
@@ -939,7 +1026,10 @@ def build_output_row(optimized_result, tether_force_max):
         "optimized_Fy": optimized_result["Fy"],
         "optimized_tether_force_ground": optimized_result["tether_force_ground"],
         "Fx_over_tether_force": optimized_result.get("Fx_over_tether_force", np.nan),
-        "projection_loss_angle_deg": optimized_result.get("projection_loss_angle_deg", np.nan),
+        "projection_loss_angle_deg": optimized_result.get(
+            "projection_loss_angle_deg",
+            np.nan,
+        ),
         "tether_force_max": tether_force_max,
         "tether_force_effective_limit": tether_force_max - FORCE_SAFETY_MARGIN,
         "tether_constraint_violation": optimized_result["tether_constraint_violation"],
@@ -994,10 +1084,17 @@ def print_progress(
 
     best_kw = best_power / 1000.0 if np.isfinite(best_power) else np.nan
 
+    runtime_s = row.get("case_runtime_s", np.nan)
+    n_candidates = row.get("n_candidates_tried", np.nan)
+    max_candidate_runtime_s = row.get("max_candidate_runtime_s", np.nan)
+
     msg = (
         f"  Vw={wind_speed:5.1f} m/s | "
         f"{i:03d}/{total:03d} | "
         f"ψ={heading_deg:7.2f} deg | "
+        f"t={format_s(runtime_s)}s | "
+        f"cand={int(n_candidates) if np.isfinite(n_candidates) else 0:02d} | "
+        f"tcand,max={format_s(max_candidate_runtime_s)}s | "
         f"accepted={accepted_count:03d} | "
         f"failed={failed_count:03d} | "
         f"Peq={P_kw:9.3f} kW | "
@@ -1011,7 +1108,7 @@ def print_progress(
         f"best={best_kw:9.3f} kW"
     )
 
-    sys.stdout.write("\r" + msg.ljust(260))
+    sys.stdout.write("\r" + msg.ljust(360))
     sys.stdout.flush()
 
 

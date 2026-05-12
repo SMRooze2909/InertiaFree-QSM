@@ -9,13 +9,21 @@ This version:
 - Mirrors the 0-180 deg result to 180-360 deg for plotting only.
 - Saves only the actually computed 0-180 deg results to CSV.
 - Produces only one plot: a mirrored polar plot of positive P_equiv_pumping.
+- Adds runtime logging per heading case and per multistart candidate.
+- Adds candidate-level logging to diagnose slow starts and local optima.
+- Adds pumping-quality diagnostics to detect traction-dominated pumping solutions.
+
+Important:
+- This version does NOT hard-timeout inside optimizer.optimize().
+- The runtime logging measures how long candidates take after they return.
+- A true hard timeout requires multiprocessing or modifying the optimizer internals.
 
 Objective:
     maximize P_equiv_pumping = P_cycle + Fx_avg * V_ship
 
 where:
     P_cycle       = cycle-averaged pumping power [W]
-    Fx_avg        = cycle-averaged ship-surge force [N]
+    Fx_avg        = cycle-averaged ship-frame surge force [N]
     V_ship        = ship speed [m/s]
 
 Physical convention:
@@ -33,6 +41,7 @@ import sys
 import csv
 import io
 import contextlib
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -64,10 +73,8 @@ from inertiafree_qsm.vessel_coupling import (
     compute_apparent_wind,
 )
 
-try:
-    from inertiafree_qsm.cycle_optimizer import CycleOptimizer
-except ImportError:
-    from inertiafree_qsm.optimizer import CycleOptimizer
+from inertiafree_qsm.cycle_optimizer import CycleOptimizer
+
 
 
 # =============================================================================
@@ -84,18 +91,20 @@ SIMULATION_SETTINGS_PATH = PROJECT_ROOT / "data" / "simulation_settings.yml"
 
 CSV_OUTPUT_PATH = RESULTS_DIR / "optimized_pumping_heading_wind_sweep.csv"
 CSV_AUTOSAVE_PATH = RESULTS_DIR / "optimized_pumping_heading_wind_sweep_autosave.csv"
+CSV_CANDIDATE_LOG_PATH = RESULTS_DIR / "optimized_pumping_candidate_log.csv"
 
 
 # =============================================================================
 # Sweep settings
 # =============================================================================
 
-SHIP_SPEED = 4.0
-CLUSTER_ID = 1
+SHIP_SPEED = 4.0 #this is the prescribed ship speed in m/s
+CLUSTER_ID = 1 #Cluster 1 is one representative ERA5 wind-profile shape, normalized around the 200 m wind speed.
 
 # Use 2 or 3 wind speeds for debugging/plotting.
-TRUE_WIND_SPEEDS = np.array([6,8,10,12,14,16,18,20], dtype=float)
+TRUE_WIND_SPEEDS = np.array([14.0], dtype=float)
 #TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
+
 # =============================================================================
 # Mirroring switch (RUNTIME SAVING PURPOSES)
 # =============================================================================
@@ -104,7 +113,11 @@ MIRROR_RESULTS_FOR_PLOT = True
 # True  = compute only 0–180 deg, mirror 180–360 deg for polar plotting 
 # False = compute full 0–360 deg, no mirroring
 
-HEADING_STEP_DEG = 5.0
+
+# Angular resolution of the heading sweep, smaller step --> more detail and optimizer jitter between nearby headings
+# Larger step --> smoother-looking plots but can hide local jumps or switching behavior.
+# It affects plotting resolution and runtime
+HEADING_STEP_DEG = 15.0
 
 if MIRROR_RESULTS_FOR_PLOT:
     SWEEP_HEADINGS = np.arange(0.0, 181.0, HEADING_STEP_DEG)
@@ -121,37 +134,52 @@ PLOT_ONLY_POSITIVE_EQUIVALENT_BENEFIT = True
 # =============================================================================
 
 # Maximum number of different initial guesses tried for each wind/heading case.
-# Higher values improve robustness but increase runtime.
-MAX_MULTISTART_CANDIDATES = 2
+# Higher values --> improved robustness and increased runtime.
+# Too low can cause neighboring headings to jump between different local solutions.
+MAX_MULTISTART_CANDIDATES = 3
 
 # Caps the native optimizer iterations per candidate for faster debug sweeps.
-# Increase this for final runs if cases stop before converging.
-MAX_OPTIMIZER_ITERATIONS_DEBUG = 60
+# Higher values usually reduce noisy/jittery results but increase runtime.
+# Too low can stop the optimizer before it reaches a stable optimum.
+MAX_OPTIMIZER_ITERATIONS_DEBUG = 80
 
 # Print detailed optimizer progress from scipy/QSM when True.
 OPTIMIZER_VERBOSE = False
 
 # Suppress native optimizer stdout when True, keeping the sweep progress readable.
 QUIET_NATIVE_OPTIMIZER_OUTPUT = True
-
 # Save the CSV after every evaluated case, so partial results survive interruption.
 AUTOSAVE_AFTER_EACH_CASE = True
+AUTOSAVE_CANDIDATE_LOG_AFTER_EACH_CASE = False
 
 # Numerical tolerance [N] for checking tether-force constraint violations.
 FORCE_TOLERANCE = 1.0
-
 # Power threshold [W] below which a case is treated as effectively inactive.
-ZERO_POWER_THRESHOLD = 10.0
-
+# Increasing this hides very small-power cases in plots/results.
+# It does not fix physics; it only filters negligible results.
+# Too high may remove valid low-wind pumping cases.
+ZERO_POWER_THRESHOLD = 0
 GRAVITATIONAL_ACCELERATION = 9.80665
+# Keep at 0.0 for now. Later set e.g. 100.0 W if you want to reject “valid force but negligible cycle power” cases.
+# Useful for avoiding traction-like pumping solutions.
+# Too high may reject realistic low-wind pumping cases.
+MIN_P_CYCLE_FOR_VALID_PUMPING = 0
 
-# Keep at 0.0 for now. Later set e.g. 100.0 W if you want to reject
-# “valid force but negligible cycle power” cases.
-MIN_P_CYCLE_FOR_VALID_PUMPING = 0.0
-
+# Too high may reject otherwise feasible low-wind cases.
 # Minimum stroke as fraction of max tether length.
 # Example: 0.05 and max_tether_length = 600 m gives minimum 30 m stroke.
+# Minimum allowed reel-out/reel-in stroke as a fraction of max tether length.
+# Increasing this forces a larger pumping stroke, making the solution more physically pump-like.
+# Too low can allow short-stroke/traction-like solutions and jitter.
 MIN_TETHER_LENGTH_FRACTION_DIFFERENCE = 0.05
+
+# Diagnostic only for now. This does NOT reject cases unless
+# REJECT_TRACTION_DOMINATED_PUMPING is set to True.
+MIN_PUMPING_RATIO_DIAGNOSTIC = 0.30
+REJECT_TRACTION_DOMINATED_PUMPING = False
+
+# Very small number to avoid division by zero in diagnostic ratios.
+EPS_POWER = 1.0e-9
 
 
 # =============================================================================
@@ -164,6 +192,12 @@ def format_kw(value_w: float) -> str:
     return f"{value_w / 1000.0:7.3f}"
 
 
+def format_s(value_s: float) -> str:
+    if not np.isfinite(value_s):
+        return "   nan"
+    return f"{value_s:6.1f}"
+
+
 def safe_float(value: Any, default: float = np.nan) -> float:
     try:
         value = float(value)
@@ -171,6 +205,61 @@ def safe_float(value: Any, default: float = np.nan) -> float:
         return default
 
     return value if np.isfinite(value) else default
+
+
+# =============================================================================
+# Pumping-quality diagnostics
+# =============================================================================
+
+def compute_pumping_quality_diagnostics(
+    P_cycle: float,
+    P_prop_equiv: float,
+) -> dict[str, float | bool]:
+    """
+    Diagnose whether the accepted pumping solution is genuinely pumping-like
+    or mostly traction-like.
+
+    Definitions:
+    - P_prop_abs: absolute propulsion-equivalent contribution |Fx_avg * V_ship|
+    - pump_ratio: P_cycle / |P_prop_equiv|
+    - P_prop_fraction_abs: |P_prop_equiv| / (|P_cycle| + |P_prop_equiv|)
+    - traction_dominated_flag: True if propulsion term dominates too strongly
+
+    Interpretation:
+    - pump_ratio << 1 means the case is mainly force/traction benefit,
+      not real cycle generation.
+    - This is diagnostic by default, not a hard rejection.
+    """
+
+    P_cycle = float(P_cycle)
+    P_prop_equiv = float(P_prop_equiv)
+
+    P_prop_abs = abs(P_prop_equiv)
+    P_cycle_abs = abs(P_cycle)
+
+    if P_prop_abs > EPS_POWER:
+        pump_ratio = P_cycle / P_prop_abs
+    else:
+        pump_ratio = np.inf
+
+    denominator = P_cycle_abs + P_prop_abs
+    if denominator > EPS_POWER:
+        P_prop_fraction_abs = P_prop_abs / denominator
+    else:
+        P_prop_fraction_abs = np.nan
+
+    traction_dominated_flag = bool(
+        np.isfinite(pump_ratio)
+        and pump_ratio < MIN_PUMPING_RATIO_DIAGNOSTIC
+        and P_prop_abs > EPS_POWER
+    )
+
+    return {
+        "P_prop_abs": float(P_prop_abs),
+        "pump_ratio": float(pump_ratio),
+        "P_prop_fraction_abs": float(P_prop_fraction_abs),
+        "traction_dominated_flag": traction_dominated_flag,
+    }
 
 
 # =============================================================================
@@ -252,7 +341,7 @@ def extract_cycle_samples_from_kpi(kpi: dict[str, Any]) -> dict[str, np.ndarray]
 
     kinematics = list(kpi["kinematics"])
     steady_states = list(kpi["steady_states"])
-    time = np.asarray(kpi["time"], dtype=float)
+    time_values = np.asarray(kpi["time"], dtype=float)
 
     if len(kinematics) == 0:
         raise ValueError("kpi['kinematics'] is empty.")
@@ -260,14 +349,14 @@ def extract_cycle_samples_from_kpi(kpi: dict[str, Any]) -> dict[str, np.ndarray]
     if len(steady_states) == 0:
         raise ValueError("kpi['steady_states'] is empty.")
 
-    n = min(len(kinematics), len(steady_states), len(time))
+    n = min(len(kinematics), len(steady_states), len(time_values))
 
     if n <= 0:
         raise ValueError("No overlapping cycle samples found.")
 
     kinematics = kinematics[:n]
     steady_states = steady_states[:n]
-    time = time[:n]
+    time_values = time_values[:n]
 
     tether_force_ground = np.array(
         [ss.tether_force_ground for ss in steady_states],
@@ -293,36 +382,36 @@ def extract_cycle_samples_from_kpi(kpi: dict[str, Any]) -> dict[str, np.ndarray]
     if not np.all(np.isfinite(elevation_angle)):
         raise ValueError("Non-finite elevation_angle values found.")
 
-    if not np.all(np.isfinite(time)):
+    if not np.all(np.isfinite(time_values)):
         raise ValueError("Non-finite time values found.")
 
-    if len(time) > 1 and time[-1] <= time[0]:
+    if len(time_values) > 1 and time_values[-1] <= time_values[0]:
         raise ValueError("Cycle time array is not increasing.")
 
     return {
-        "time": time,
+        "time": time_values,
         "tether_force_ground": tether_force_ground,
         "azimuth_angle_qsm": azimuth_angle_qsm,
         "elevation_angle": elevation_angle,
     }
 
 
-def time_average(values: np.ndarray, time: np.ndarray) -> float:
+def time_average(values: np.ndarray, time_values: np.ndarray) -> float:
     values = np.asarray(values, dtype=float)
-    time = np.asarray(time, dtype=float)
+    time_values = np.asarray(time_values, dtype=float)
 
     if len(values) == 1:
         return float(values[0])
 
-    duration = float(time[-1] - time[0])
+    duration = float(time_values[-1] - time_values[0])
 
     if duration <= 0.0:
         return float(np.mean(values))
 
     if hasattr(np, "trapezoid"):
-        integral = np.trapezoid(values, time)
+        integral = np.trapezoid(values, time_values)
     else:
-        integral = np.trapz(values, time)
+        integral = np.trapz(values, time_values)
 
     return float(integral / duration)
 
@@ -338,12 +427,12 @@ def compute_cycle_average_ship_forces_from_kpi(
 
     samples = extract_cycle_samples_from_kpi(kpi)
 
-    time = samples["time"]
+    time_values = samples["time"]
     tether_force_ground = samples["tether_force_ground"]
     azimuth_angle_qsm = samples["azimuth_angle_qsm"]
     elevation_angle = samples["elevation_angle"]
 
-    n = len(time)
+    n = len(time_values)
 
     Fx_ship = np.zeros(n, dtype=float)
     Fy_ship = np.zeros(n, dtype=float)
@@ -367,11 +456,11 @@ def compute_cycle_average_ship_forces_from_kpi(
         )
 
     return {
-        "Fx_avg": time_average(Fx_ship, time),
-        "Fy_avg": time_average(Fy_ship, time),
-        "Fx_global_avg": time_average(Fx_global, time),
-        "Fy_global_avg": time_average(Fy_global, time),
-        "mean_tether_force": time_average(tether_force_ground, time),
+        "Fx_avg": time_average(Fx_ship, time_values),
+        "Fy_avg": time_average(Fy_ship, time_values),
+        "Fx_global_avg": time_average(Fx_global, time_values),
+        "Fy_global_avg": time_average(Fy_global, time_values),
+        "mean_tether_force": time_average(tether_force_ground, time_values),
         "max_tether_force": float(np.max(tether_force_ground)),
         "n_force_samples": int(n),
     }
@@ -432,6 +521,11 @@ class MovingVesselPumpingOptimizer(CycleOptimizer):
         P_prop_penalty = max(-P_prop_equiv, 0.0)
         P_equiv_pumping = P_cycle + P_prop_equiv
 
+        quality = compute_pumping_quality_diagnostics(
+            P_cycle=P_cycle,
+            P_prop_equiv=P_prop_equiv,
+        )
+
         objective_data = {
             "P_cycle": P_cycle,
             "Fx_avg": Fx_avg,
@@ -444,6 +538,7 @@ class MovingVesselPumpingOptimizer(CycleOptimizer):
             "P_prop_penalty": P_prop_penalty,
             "P_equiv_pumping": P_equiv_pumping,
             "n_force_samples": force_data["n_force_samples"],
+            **quality,
         }
 
         return float(P_equiv_pumping), objective_data
@@ -803,6 +898,7 @@ def build_inactive_low_apparent_wind_kpi(
             "P_prop_penalty": 0.0,
             "P_equiv_pumping": 0.0,
             "n_force_samples": 0,
+            **compute_pumping_quality_diagnostics(0.0, 0.0),
         },
         "true_wind_speed": float(true_wind_speed),
         "ship_speed": float(ship_speed),
@@ -812,6 +908,13 @@ def build_inactive_low_apparent_wind_kpi(
         "apparent_wind_direction_deg": float(np.rad2deg(apparent_wind.direction_to)),
         "last_var_names": [],
         "last_x_opt": None,
+        "case_runtime_s": 0.0,
+        "n_candidates_tried": 0,
+        "selected_candidate_index": -1,
+        "selected_candidate_runtime_s": 0.0,
+        "max_candidate_runtime_s": 0.0,
+        "mean_candidate_runtime_s": 0.0,
+        "sum_candidate_runtime_s": 0.0,
     }
 
     return kpi, warm_x0_base
@@ -837,14 +940,34 @@ def is_physically_usable_kpi(
         "max_tether_force",
         "P_prop_equiv",
         "P_equiv_pumping",
+        "pump_ratio",
+        "traction_dominated_flag",
     ]
 
     for key in required:
+        if key not in data:
+            return False
+
+    numeric_required = [
+        "P_cycle",
+        "Fx_avg",
+        "Fy_avg",
+        "mean_tether_force",
+        "max_tether_force",
+        "P_prop_equiv",
+        "P_equiv_pumping",
+    ]
+
+    for key in numeric_required:
         if not np.isfinite(data.get(key, np.nan)):
             return False
 
     if float(data.get("P_cycle", 0.0)) < MIN_P_CYCLE_FOR_VALID_PUMPING:
         return False
+
+    if REJECT_TRACTION_DOMINATED_PUMPING:
+        if bool(data.get("traction_dominated_flag", False)):
+            return False
 
     if np.isfinite(tether_force_max):
         max_tether_force = float(data["max_tether_force"])
@@ -853,6 +976,40 @@ def is_physically_usable_kpi(
             return False
 
     return True
+
+
+def add_runtime_metadata_to_results(
+    results: list[dict[str, Any]],
+    candidate_runtimes: list[float],
+    case_runtime_s: float,
+) -> None:
+    """
+    Attach case-level and candidate-level runtime metadata to every candidate KPI.
+    """
+
+    n_candidates = len(results)
+    max_candidate_runtime_s = (
+        float(max(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+    mean_candidate_runtime_s = (
+        float(np.mean(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+    sum_candidate_runtime_s = (
+        float(np.sum(candidate_runtimes)) if candidate_runtimes else 0.0
+    )
+
+    for candidate_index, kpi_result in enumerate(results):
+        kpi_result["case_runtime_s"] = float(case_runtime_s)
+        kpi_result["n_candidates_tried"] = int(n_candidates)
+        kpi_result["candidate_index"] = int(candidate_index)
+        kpi_result["candidate_runtime_s"] = (
+            float(candidate_runtimes[candidate_index])
+            if candidate_index < len(candidate_runtimes)
+            else np.nan
+        )
+        kpi_result["max_candidate_runtime_s"] = max_candidate_runtime_s
+        kpi_result["mean_candidate_runtime_s"] = mean_candidate_runtime_s
+        kpi_result["sum_candidate_runtime_s"] = sum_candidate_runtime_s
 
 
 def optimize_one_heading_case(
@@ -864,10 +1021,16 @@ def optimize_one_heading_case(
     tether_force_max: float,
     min_apparent_wind_speed: float,
     warm_x0_base: np.ndarray | None = None,
-) -> tuple[dict[str, Any], np.ndarray | None]:
+) -> tuple[dict[str, Any], np.ndarray | None, list[dict[str, Any]]]:
     """
     Optimize one true-wind / ship-heading case.
+
+    Returns:
+        best_kpi, new_warm_x0, candidate_log_rows
     """
+
+    case_start_time = time.perf_counter()
+    candidate_runtimes: list[float] = []
 
     apparent_wind, vessel_heading = compute_case_apparent_wind(
         true_wind_speed=true_wind_speed,
@@ -876,7 +1039,7 @@ def optimize_one_heading_case(
     )
 
     if apparent_wind.speed < min_apparent_wind_speed:
-        return build_inactive_low_apparent_wind_kpi(
+        kpi, new_warm_x0 = build_inactive_low_apparent_wind_kpi(
             true_wind_speed=true_wind_speed,
             ship_speed=ship_speed,
             heading_deg=heading_deg,
@@ -884,6 +1047,8 @@ def optimize_one_heading_case(
             min_apparent_wind_speed=min_apparent_wind_speed,
             warm_x0_base=warm_x0_base,
         )
+        kpi["case_runtime_s"] = float(time.perf_counter() - case_start_time)
+        return kpi, new_warm_x0, []
 
     x0_candidates = build_x0_candidates(
         simulation_settings=constructor.simulation_settings,
@@ -893,7 +1058,8 @@ def optimize_one_heading_case(
 
     results = []
 
-    for x0_base in x0_candidates:
+    for candidate_index, x0_base in enumerate(x0_candidates):
+        candidate_start_time = time.perf_counter()
         optimizer = None
 
         try:
@@ -953,6 +1119,11 @@ def optimize_one_heading_case(
                 "objective_data": {},
             }
 
+        candidate_runtime_s = time.perf_counter() - candidate_start_time
+        candidate_runtimes.append(float(candidate_runtime_s))
+
+        kpi["candidate_index"] = int(candidate_index)
+        kpi["candidate_runtime_s"] = float(candidate_runtime_s)
         kpi["true_wind_speed"] = float(true_wind_speed)
         kpi["ship_speed"] = float(ship_speed)
         kpi["heading_deg"] = float(heading_deg)
@@ -970,6 +1141,13 @@ def optimize_one_heading_case(
             kpi["last_x_opt"] = None
 
         results.append(kpi)
+
+    case_runtime_s = time.perf_counter() - case_start_time
+    add_runtime_metadata_to_results(
+        results=results,
+        candidate_runtimes=candidate_runtimes,
+        case_runtime_s=case_runtime_s,
+    )
 
     feasible_results = [
         r for r in results
@@ -997,6 +1175,31 @@ def optimize_one_heading_case(
         else:
             best = results[0]
 
+    selected_candidate_index = int(best.get("candidate_index", -1))
+    selected_candidate_runtime_s = float(best.get("candidate_runtime_s", np.nan))
+
+    best["selected_candidate_index"] = selected_candidate_index
+    best["selected_candidate_runtime_s"] = selected_candidate_runtime_s
+
+    candidate_log_rows = []
+    best_objective = best.get("objective_data", {}).get("P_equiv_pumping", np.nan)
+    best_x = best.get("last_x_opt", None)
+
+    for r in results:
+        selected_best = False
+        if r.get("candidate_index", -999) == selected_candidate_index:
+            selected_best = True
+
+        candidate_log_rows.append(
+            build_candidate_log_row(
+                kpi=r,
+                x0_base=x0_candidates[int(r.get("candidate_index", 0))],
+                selected_best=selected_best,
+                best_objective=best_objective,
+                best_x=best_x,
+            )
+        )
+
     new_warm_x0 = None
 
     if (
@@ -1011,7 +1214,7 @@ def optimize_one_heading_case(
             x_opt=np.asarray(best["last_x_opt"], dtype=float),
         )
 
-    return best, new_warm_x0
+    return best, new_warm_x0, candidate_log_rows
 
 
 # =============================================================================
@@ -1072,10 +1275,7 @@ def build_output_row(
         "heading_deg": kpi.get("heading_deg", np.nan),
         "apparent_wind_speed": kpi.get("apparent_wind_speed", np.nan),
         "min_apparent_wind_speed": kpi.get("min_apparent_wind_speed", np.nan),
-        "apparent_wind_direction_deg": kpi.get(
-            "apparent_wind_direction_deg",
-            np.nan,
-        ),
+        "apparent_wind_direction_deg": kpi.get("apparent_wind_direction_deg", np.nan),
         "case_status": case_status,
         "inactive_low_apparent_wind": inactive_low_apparent_wind,
         "case_successful": kpi.get("case_successful", False),
@@ -1086,6 +1286,13 @@ def build_output_row(
         "accepted_despite_optimizer_message": accepted_despite_optimizer_message,
         "case_error_message": kpi.get("case_error_message", ""),
         "optimizer_message": optimizer_message,
+        "case_runtime_s": kpi.get("case_runtime_s", np.nan),
+        "n_candidates_tried": kpi.get("n_candidates_tried", np.nan),
+        "selected_candidate_index": kpi.get("selected_candidate_index", np.nan),
+        "selected_candidate_runtime_s": kpi.get("selected_candidate_runtime_s", np.nan),
+        "max_candidate_runtime_s": kpi.get("max_candidate_runtime_s", np.nan),
+        "mean_candidate_runtime_s": kpi.get("mean_candidate_runtime_s", np.nan),
+        "sum_candidate_runtime_s": kpi.get("sum_candidate_runtime_s", np.nan),
         "P_cycle": data.get("P_cycle", np.nan),
         "P_in": kpi.get("average_power", {}).get("in", np.nan),
         "P_trans_riro": kpi.get("average_power", {}).get("trans_riro", np.nan),
@@ -1105,6 +1312,10 @@ def build_output_row(
         "P_prop_equiv": data.get("P_prop_equiv", np.nan),
         "P_prop_penalty": data.get("P_prop_penalty", np.nan),
         "P_equiv_pumping": data.get("P_equiv_pumping", np.nan),
+        "P_prop_abs": data.get("P_prop_abs", np.nan),
+        "pump_ratio": data.get("pump_ratio", np.nan),
+        "P_prop_fraction_abs": data.get("P_prop_fraction_abs", np.nan),
+        "traction_dominated_flag": data.get("traction_dominated_flag", False),
         "n_force_samples": data.get("n_force_samples", np.nan),
         "max_tether_length": max_tether_length,
         "stroke_fraction": np.nan,
@@ -1131,8 +1342,70 @@ def build_output_row(
     return row
 
 
+def build_candidate_log_row(
+    kpi: dict[str, Any],
+    x0_base: np.ndarray,
+    selected_best: bool,
+    best_objective: float,
+    best_x: np.ndarray | None,
+) -> dict[str, Any]:
+    data = kpi.get("objective_data", {})
+    opt_result = kpi.get("optimization_result", None)
+
+    if opt_result is None:
+        optimizer_success = bool(kpi.get("sim_successful", False))
+        optimizer_message = "No active optimization variables or optimization not run."
+    else:
+        optimizer_success = bool(opt_result.success)
+        optimizer_message = str(opt_result.message)
+
+    row = {
+        "true_wind_speed": kpi.get("true_wind_speed", np.nan),
+        "ship_speed": kpi.get("ship_speed", np.nan),
+        "heading_deg": kpi.get("heading_deg", np.nan),
+        "apparent_wind_speed": kpi.get("apparent_wind_speed", np.nan),
+        "apparent_wind_direction_deg": kpi.get("apparent_wind_direction_deg", np.nan),
+        "candidate_index": kpi.get("candidate_index", np.nan),
+        "selected_best": bool(selected_best),
+        "candidate_runtime_s": kpi.get("candidate_runtime_s", np.nan),
+        "case_runtime_s": kpi.get("case_runtime_s", np.nan),
+        "case_status": kpi.get("case_status", "unknown"),
+        "case_successful": kpi.get("case_successful", False),
+        "sim_successful": kpi.get("sim_successful", False),
+        "optimizer_success": optimizer_success,
+        "optimizer_message": optimizer_message,
+        "case_error_message": kpi.get("case_error_message", ""),
+        "objective_value": kpi.get("objective_value", np.nan),
+        "best_objective": best_objective,
+        "P_cycle": data.get("P_cycle", np.nan),
+        "P_prop_equiv": data.get("P_prop_equiv", np.nan),
+        "P_equiv_pumping": data.get("P_equiv_pumping", np.nan),
+        "P_prop_abs": data.get("P_prop_abs", np.nan),
+        "pump_ratio": data.get("pump_ratio", np.nan),
+        "P_prop_fraction_abs": data.get("P_prop_fraction_abs", np.nan),
+        "traction_dominated_flag": data.get("traction_dominated_flag", False),
+        "Fx_avg": data.get("Fx_avg", np.nan),
+        "Fy_avg": data.get("Fy_avg", np.nan),
+        "mean_tether_force": data.get("mean_tether_force", np.nan),
+        "max_tether_force": data.get("max_tether_force", np.nan),
+    }
+
+    x0_base = np.asarray(x0_base, dtype=float)
+    for i, value in enumerate(x0_base):
+        row[f"start_x0_{i}"] = float(value)
+
+    var_names = kpi.get("last_var_names", [])
+    x_opt = kpi.get("last_x_opt", None)
+
+    if x_opt is not None:
+        for name, value in zip(var_names, x_opt):
+            row[f"opt_{name}"] = float(value)
+
+    return row
+
+
 # =============================================================================
-# CSV
+# CSV helpers
 # =============================================================================
 
 def collect_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
@@ -1153,6 +1426,13 @@ def collect_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "accepted_despite_optimizer_message",
         "case_error_message",
         "optimizer_message",
+        "case_runtime_s",
+        "n_candidates_tried",
+        "selected_candidate_index",
+        "selected_candidate_runtime_s",
+        "max_candidate_runtime_s",
+        "mean_candidate_runtime_s",
+        "sum_candidate_runtime_s",
     ]
 
     opt_fields = sorted(
@@ -1184,6 +1464,10 @@ def collect_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "P_prop_equiv",
         "P_prop_penalty",
         "P_equiv_pumping",
+        "P_prop_abs",
+        "pump_ratio",
+        "P_prop_fraction_abs",
+        "traction_dominated_flag",
         "n_force_samples",
         "max_tether_length",
         "stroke_fraction",
@@ -1191,6 +1475,50 @@ def collect_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
     ]
 
     return base_fields + opt_fields + result_fields
+
+
+def collect_candidate_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
+    fixed_fields = [
+        "true_wind_speed",
+        "ship_speed",
+        "heading_deg",
+        "apparent_wind_speed",
+        "apparent_wind_direction_deg",
+        "candidate_index",
+        "selected_best",
+        "candidate_runtime_s",
+        "case_runtime_s",
+        "case_status",
+        "case_successful",
+        "sim_successful",
+        "optimizer_success",
+        "optimizer_message",
+        "case_error_message",
+        "objective_value",
+        "best_objective",
+        "P_cycle",
+        "P_prop_equiv",
+        "P_equiv_pumping",
+        "P_prop_abs",
+        "pump_ratio",
+        "P_prop_fraction_abs",
+        "traction_dominated_flag",
+        "Fx_avg",
+        "Fy_avg",
+        "mean_tether_force",
+        "max_tether_force",
+    ]
+
+    dynamic_fields = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if key.startswith("start_x0_") or key.startswith("opt_")
+        }
+    )
+
+    return fixed_fields + dynamic_fields
 
 
 def save_results_to_csv(
@@ -1214,6 +1542,27 @@ def save_results_to_csv(
         print(f"\nSaved optimized pumping wind-heading sweep to:\n  {output_path}")
 
 
+def save_candidate_log_to_csv(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    quiet: bool = False,
+) -> None:
+    if not rows:
+        return
+
+    fieldnames = collect_candidate_fieldnames(rows)
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    if not quiet:
+        print(f"\nSaved pumping candidate log to:\n  {output_path}")
+
+
 # =============================================================================
 # Sweep functions
 # =============================================================================
@@ -1235,17 +1584,27 @@ def print_progress(
         p_penalty = row.get("P_prop_penalty", np.nan)
         p_equiv = row.get("P_equiv_pumping", np.nan)
         fx_avg = row.get("Fx_avg", np.nan)
+        pump_ratio = row.get("pump_ratio", np.nan)
     else:
         p_cycle = np.nan
         p_prop = np.nan
         p_penalty = np.nan
         p_equiv = np.nan
         fx_avg = np.nan
+        pump_ratio = np.nan
+
+    runtime_s = row.get("case_runtime_s", np.nan)
+    n_candidates = row.get("n_candidates_tried", np.nan)
+    max_candidate_runtime_s = row.get("max_candidate_runtime_s", np.nan)
+    traction_dom = row.get("traction_dominated_flag", False)
 
     msg = (
         f"  Vw={wind_speed:5.1f} m/s | "
         f"{i:03d}/{total:03d} | "
         f"ψ={heading_deg:7.2f} deg | "
+        f"t={format_s(runtime_s)}s | "
+        f"cand={int(n_candidates) if np.isfinite(n_candidates) else 0:02d} | "
+        f"tcand,max={format_s(max_candidate_runtime_s)}s | "
         f"accepted={accepted_count:03d} | "
         f"inactive={inactive_count:03d} | "
         f"failed={failed_count:03d} | "
@@ -1254,10 +1613,12 @@ def print_progress(
         f"pen={format_kw(p_penalty)} kW | "
         f"Peq={format_kw(p_equiv)} kW | "
         f"Fx={fx_avg:9.1f} N | "
+        f"ratio={pump_ratio:6.3f} | "
+        f"tracdom={str(traction_dom):5s} | "
         f"best={format_kw(best_power)} kW"
     )
 
-    sys.stdout.write("\r" + msg.ljust(240))
+    sys.stdout.write("\r" + msg.ljust(360))
     sys.stdout.flush()
 
 
@@ -1271,8 +1632,10 @@ def run_heading_sweep(
     max_tether_length: float,
     min_apparent_wind_speed: float,
     autosave_prefix_rows: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
+    autosave_prefix_candidate_rows: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows = []
+    candidate_rows = []
 
     warm_x0_base = None
     accepted_count = 0
@@ -1283,7 +1646,7 @@ def run_heading_sweep(
     total = len(headings)
 
     for i, heading_deg in enumerate(headings, start=1):
-        kpi, new_warm_x0 = optimize_one_heading_case(
+        kpi, new_warm_x0, case_candidate_rows = optimize_one_heading_case(
             constructor=constructor,
             env_state=env_state,
             true_wind_speed=float(true_wind_speed),
@@ -1301,6 +1664,7 @@ def run_heading_sweep(
         )
 
         rows.append(row)
+        candidate_rows.extend(case_candidate_rows)
 
         if row["accepted_result"]:
             accepted_count += 1
@@ -1312,12 +1676,24 @@ def run_heading_sweep(
             failed_count += 1
 
         if AUTOSAVE_AFTER_EACH_CASE:
-            prefix = autosave_prefix_rows if autosave_prefix_rows is not None else []
+            prefix_rows = autosave_prefix_rows if autosave_prefix_rows is not None else []
             save_results_to_csv(
-                rows=prefix + rows,
+                rows=prefix_rows + rows,
                 output_path=CSV_AUTOSAVE_PATH,
                 quiet=True,
             )
+
+            prefix_candidate_rows = (
+                autosave_prefix_candidate_rows
+                if autosave_prefix_candidate_rows is not None
+                else []
+            )
+            if AUTOSAVE_CANDIDATE_LOG_AFTER_EACH_CASE:
+                save_candidate_log_to_csv(
+                    rows=prefix_candidate_rows + candidate_rows,
+                    output_path=CSV_CANDIDATE_LOG_PATH,
+                    quiet=True,
+                )
 
         print_progress(
             wind_speed=true_wind_speed,
@@ -1332,7 +1708,7 @@ def run_heading_sweep(
         )
 
     print("")
-    return rows
+    return rows, candidate_rows
 
 
 def run_wind_heading_sweep(
@@ -1344,8 +1720,9 @@ def run_wind_heading_sweep(
     tether_force_max: float,
     max_tether_length: float,
     min_apparent_wind_speed: float,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     all_rows = []
+    all_candidate_rows = []
 
     for true_wind_speed in true_wind_speeds:
         print(
@@ -1354,7 +1731,7 @@ def run_wind_heading_sweep(
             f"ship speed = {ship_speed:.1f} m/s"
         )
 
-        rows = run_heading_sweep(
+        rows, candidate_rows = run_heading_sweep(
             constructor=constructor,
             env_state=env_state,
             true_wind_speed=float(true_wind_speed),
@@ -1364,11 +1741,13 @@ def run_wind_heading_sweep(
             max_tether_length=max_tether_length,
             min_apparent_wind_speed=min_apparent_wind_speed,
             autosave_prefix_rows=all_rows,
+            autosave_prefix_candidate_rows=all_candidate_rows,
         )
 
         all_rows.extend(rows)
+        all_candidate_rows.extend(candidate_rows)
 
-    return all_rows
+    return all_rows, all_candidate_rows
 
 
 # =============================================================================
@@ -1394,6 +1773,10 @@ def print_compact_summary(rows: list[dict[str, Any]]) -> None:
             if not r.get("accepted_result", False)
             and not r.get("inactive_low_apparent_wind", False)
         ]
+        traction_dominated = [
+            r for r in group
+            if bool(r.get("traction_dominated_flag", False))
+        ]
 
         if accepted:
             best = max(accepted, key=lambda r: r.get("P_equiv_pumping", -np.inf))
@@ -1403,18 +1786,127 @@ def print_compact_summary(rows: list[dict[str, Any]]) -> None:
             max_p = np.nan
             best_heading = np.nan
 
+        runtimes = [
+            float(r.get("case_runtime_s", np.nan))
+            for r in group
+            if np.isfinite(r.get("case_runtime_s", np.nan))
+        ]
+        total_runtime = float(np.sum(runtimes)) if runtimes else np.nan
+        max_runtime = float(np.max(runtimes)) if runtimes else np.nan
+
         print(
             f"Vw={wind_speed:5.1f} m/s | "
             f"accepted={len(accepted):02d} | "
             f"inactive={len(inactive):02d} | "
             f"failed={len(failed):02d} | "
-            f"best Peq={max_p:8.3f} kW at ψ={best_heading:7.2f} deg"
+            f"tracdom={len(traction_dominated):02d} | "
+            f"best Peq={max_p:8.3f} kW at ψ={best_heading:7.2f} deg | "
+            f"runtime total={total_runtime:7.1f}s | "
+            f"runtime max={max_runtime:6.1f}s"
+        )
+
+    all_runtimes = [
+        float(r.get("case_runtime_s", np.nan))
+        for r in rows
+        if np.isfinite(r.get("case_runtime_s", np.nan))
+    ]
+
+    if all_runtimes:
+        print(
+            f"\nTotal sweep runtime from logged cases: "
+            f"{np.sum(all_runtimes):.1f} s "
+            f"({np.sum(all_runtimes) / 60.0:.2f} min)"
         )
 
 
-# =============================================================================
-# Polar plotting only
-# =============================================================================
+def print_slowest_cases(rows: list[dict[str, Any]], n: int = 10) -> None:
+    """
+    Print the slowest accepted/failed selected cases.
+    """
+
+    valid = [
+        r for r in rows
+        if np.isfinite(r.get("case_runtime_s", np.nan))
+    ]
+
+    if not valid:
+        return
+
+    slowest = sorted(
+        valid,
+        key=lambda r: float(r.get("case_runtime_s", -np.inf)),
+        reverse=True,
+    )[:n]
+
+    print("\nSLOWEST SELECTED CASES")
+    print("----------------------")
+    print(
+        " Vw | heading | runtime | cand | max cand | Vapp | accepted | status | Peq [kW] | Pcyc [kW] | Pprop [kW] | ratio | tracdom | constraint"
+    )
+
+    for r in slowest:
+        print(
+            f"{float(r.get('true_wind_speed', np.nan)):4.1f} | "
+            f"{float(r.get('heading_deg', np.nan)):7.1f} | "
+            f"{float(r.get('case_runtime_s', np.nan)):7.1f} | "
+            f"{int(r.get('n_candidates_tried', 0)) if np.isfinite(r.get('n_candidates_tried', np.nan)) else 0:4d} | "
+            f"{float(r.get('max_candidate_runtime_s', np.nan)):8.1f} | "
+            f"{float(r.get('apparent_wind_speed', np.nan)):5.2f} | "
+            f"{str(r.get('accepted_result', False)):8s} | "
+            f"{str(r.get('case_status', '')):9s} | "
+            f"{float(r.get('P_equiv_pumping', np.nan)) / 1000.0:8.3f} | "
+            f"{float(r.get('P_cycle', np.nan)) / 1000.0:8.3f} | "
+            f"{float(r.get('P_prop_equiv', np.nan)) / 1000.0:9.3f} | "
+            f"{float(r.get('pump_ratio', np.nan)):6.3f} | "
+            f"{str(r.get('traction_dominated_flag', False)):7s} | "
+            f"{str(r.get('constraint_active', False)):10s}"
+        )
+
+
+def print_slowest_candidates(candidate_rows: list[dict[str, Any]], n: int = 15) -> None:
+    """
+    Print slowest candidate starts, not only selected best cases.
+    This is important for diagnosing whether one bad multistart is causing runtime.
+    """
+
+    valid = [
+        r for r in candidate_rows
+        if np.isfinite(r.get("candidate_runtime_s", np.nan))
+    ]
+
+    if not valid:
+        return
+
+    slowest = sorted(
+        valid,
+        key=lambda r: float(r.get("candidate_runtime_s", -np.inf)),
+        reverse=True,
+    )[:n]
+
+    print("\nSLOWEST CANDIDATES")
+    print("------------------")
+    print(
+        " Vw | heading | cand | selected | runtime | success | status | Peq [kW] | Pcyc [kW] | Pprop [kW] | ratio | tracdom | message"
+    )
+
+    for r in slowest:
+        message = str(r.get("optimizer_message", ""))[:45]
+        print(
+            f"{float(r.get('true_wind_speed', np.nan)):4.1f} | "
+            f"{float(r.get('heading_deg', np.nan)):7.1f} | "
+            f"{int(r.get('candidate_index', -1)):4d} | "
+            f"{str(r.get('selected_best', False)):8s} | "
+            f"{float(r.get('candidate_runtime_s', np.nan)):7.1f} | "
+            f"{str(r.get('sim_successful', False)):7s} | "
+            f"{str(r.get('case_status', '')):9s} | "
+            f"{float(r.get('P_equiv_pumping', np.nan)) / 1000.0:8.3f} | "
+            f"{float(r.get('P_cycle', np.nan)) / 1000.0:8.3f} | "
+            f"{float(r.get('P_prop_equiv', np.nan)) / 1000.0:9.3f} | "
+            f"{float(r.get('pump_ratio', np.nan)):6.3f} | "
+            f"{str(r.get('traction_dominated_flag', False)):7s} | "
+            f"{message}"
+        )
+
 
 # =============================================================================
 # Polar plotting only
@@ -1482,8 +1974,6 @@ def make_rows_for_polar_plot(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
             mirrored["heading_deg"] = 360.0 - heading
             mirrored["mirrored_for_plot"] = True
 
-            # For mirrored ship-frame lateral force, flip sign.
-            # This does not affect P_equiv_pumping, but keeps the mirrored row physically consistent.
             if np.isfinite(mirrored.get("Fy_avg", np.nan)):
                 mirrored["Fy_avg"] = -float(mirrored["Fy_avg"])
 
@@ -1577,11 +2067,14 @@ def plot_polar_positive_p_equiv_pumping(rows: list[dict[str, Any]]) -> None:
     ax.grid(True)
     plt.show()
 
+
 # =============================================================================
 # Main
 # =============================================================================
 
 def main() -> None:
+    sweep_start_time = time.perf_counter()
+
     constructor = PowerCurveConstructor(
         system_config_path=SYSTEM_CONFIG_PATH,
         wind_resource_path=WIND_RESOURCE_PATH,
@@ -1636,6 +2129,8 @@ def main() -> None:
     print(f"Min apparent wind     : {min_apparent_wind_speed:.3f} m/s")
     print("Min apparent wind source: static take-off formula")
     print(f"Min stroke fraction   : {MIN_TETHER_LENGTH_FRACTION_DIFFERENCE:.3f}")
+    print(f"Min pumping ratio diag: {MIN_PUMPING_RATIO_DIAGNOSTIC:.3f}")
+    print(f"Reject trac-dominated : {REJECT_TRACTION_DOMINATED_PUMPING}")
 
     if np.isfinite(tether_force_max):
         print(f"Tether force max      : {tether_force_max:.3f} N")
@@ -1655,9 +2150,9 @@ def main() -> None:
     print("---------")
     print("Maximize P_equiv_pumping = P_cycle + Fx_avg * V_ship")
     print("Positive Fx_avg helps propulsion; negative Fx_avg penalizes propulsion.")
-    print("Progress shows: Pcyc, Pprop=Fx_avg*V_ship, propulsion penalty, Peq.")
+    print("Progress shows runtime, candidate count, pump ratio and traction-dominated flag.")
 
-    rows = run_wind_heading_sweep(
+    rows, candidate_rows = run_wind_heading_sweep(
         constructor=constructor,
         env_state=env_state,
         true_wind_speeds=TRUE_WIND_SPEEDS,
@@ -1672,8 +2167,20 @@ def main() -> None:
         rows=rows,
         output_path=CSV_OUTPUT_PATH,
     )
+    save_candidate_log_to_csv(
+        rows=candidate_rows,
+        output_path=CSV_CANDIDATE_LOG_PATH,
+    )
 
     print_compact_summary(rows)
+    print_slowest_cases(rows, n=10)
+    print_slowest_candidates(candidate_rows, n=15)
+
+    sweep_runtime_s = time.perf_counter() - sweep_start_time
+    print(
+        f"\nWall-clock sweep runtime: {sweep_runtime_s:.1f} s "
+        f"({sweep_runtime_s / 60.0:.2f} min)"
+    )
 
     plot_polar_positive_p_equiv_pumping(rows)
 

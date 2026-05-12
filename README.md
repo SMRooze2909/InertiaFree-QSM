@@ -234,6 +234,69 @@ A future placeholder correction can be introduced as:
 
     P_equiv_pumping_eff = eta_use * P_cycle + Fx_avg * V_ship
 
+OPTIMIZER ARCHITECTURE
+----------------------
+
+Both traction and pumping optimizers follow the same general structure:
+
+    true wind + prescribed vessel motion
+        -> apparent wind
+        -> QSM model evaluation in apparent-wind-aligned frame
+        -> force projection into ship frame
+        -> equivalent-power objective
+        -> optimized result storage
+
+The main difference is that traction mode optimizes one steady operating point,
+whereas pumping mode optimizes a full cycle.
+
+Traction optimization:
+- steady quasi-steady operating point
+- decision variables:
+    x = [azimuth_angle, elevation_angle, course_angle]
+- objective:
+    maximize P_equiv_traction = Fx_ship * V_ship
+- constraints:
+    Fx_ship >= 0
+    tether_force <= tether_force_max
+- multistart optimization is used because different local optima can exist
+  for port/starboard, crosswind, low-elevation, and force-limited branches
+- warm-starting is used between neighbouring headings
+
+Pumping optimization:
+- full quasi-steady pumping cycle
+- decision variables are inherited from the QSM CycleOptimizer and can include:
+    reeling_speed_out
+    reeling_speed_in
+    frac_start
+    frac_end
+    elevation variables
+- original QSM objective:
+    maximize P_cycle
+- moving-vessel objective:
+    maximize P_equiv_pumping = P_cycle + Fx_avg * V_ship
+- cycle force history is extracted and projected into ship axes
+- Fx_avg and Fy_avg are time-averaged over the cycle
+- multistart and warm-starting are used to improve robustness
+
+Important runtime difference:
+- traction is relatively cheap because each objective evaluation solves one
+  steady operating point
+- pumping is more expensive because each objective evaluation runs a full
+  pumping-cycle simulation and post-processes force histories
+
+Known optimizer sensitivity:
+- low apparent wind can lead to very small or flat objective values
+- high wind can activate the tether-force constraint, making the optimum lie
+  close to a constraint boundary
+- pumping can become partly traction-like when Fx_avg * V_ship dominates
+  P_cycle
+- nearby headings may converge to different local optima if multistart,
+  warm-starting, or iteration limits are not chosen carefully
+
+For future PPP coupling, the optimizers should preferably be used to generate
+offline performance maps over apparent wind speed and direction. The coupled
+vessel solver can then interpolate these maps instead of running the full kite
+optimization inside every vessel-equilibrium iteration.
 
 OPERATIONAL MAP / MODE COMPARISON
 ---------------------------------
@@ -284,6 +347,9 @@ Not yet implemented:
 - explicit aerodynamic depowering in traction mode
 - drivetrain/generator/propulsion-reuse efficiency correction for pumping
 - economic analysis based on route or wind statistics
+- optimizer timeout protection for long-running marginal cases
+- runtime benchmarking for traction and pumping optimizers
+- offline kite performance maps for efficient PPP coupling
 
 
 NEXT STEPS
@@ -308,7 +374,22 @@ Map depower to aerodynamic coefficients:
 
 This separates aerodynamic depowering from geometric depowering.
 
-3) FULL VESSEL COUPLING
+3) OPTIMIZER ROBUSTNESS AND RUNTIME CONTROL
+Before coupling to the PPP, make both traction and pumping optimizers robust and
+predictable in runtime.
+
+Required checks:
+- add runtime logging per case
+- add timeout protection for marginal cases
+- identify local-optimum jumps between neighbouring headings
+- benchmark runtime for traction and pumping separately
+- reduce pumping optimization dimensionality if needed
+- define inactive or low-benefit regions to avoid wasting runtime
+
+This is necessary because full vessel coupling may require repeated evaluations
+of kite performance inside an outer equilibrium loop.
+
+4) FULL VESSEL COUPLING
 Replace prescribed vessel speed with a vessel equilibrium model.
 
 Couple:
@@ -321,13 +402,13 @@ Solve for:
 - required propulsion power
 - possibly rudder force or yaw equilibrium
 
-4) UNIFIED MODE COMPARISON
+5) UNIFIED MODE COMPARISON
 Compare traction and pumping using propulsion-power reduction from the coupled vessel model, rather than only prescribed-speed equivalent power.
 
-5) OPERATIONAL STRATEGY
+6) OPERATIONAL STRATEGY
 Use the coupled results to define mode-selection boundaries between traction and pumping.
 
-6) ECONOMIC EVALUATION
+7) ECONOMIC EVALUATION
 Combine operational maps with wind statistics or route data to estimate:
 - propulsion energy reduction
 - fuel savings
