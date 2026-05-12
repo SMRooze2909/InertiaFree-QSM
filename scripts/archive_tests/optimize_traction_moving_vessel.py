@@ -88,7 +88,7 @@ CSV_CANDIDATE_LOG_PATH = RESULTS_DIR / "optimized_traction_candidate_log.csv"
 
 TRUE_WIND_SPEEDS = np.array([18.0], dtype=float)
 #TRUE_WIND_SPEEDS = np.array([10.0, 14.0, 18.0], dtype=float)
-SHIP_SPEED = 4.0
+SHIP_SPEED = 8.0
 CLUSTER_ID = 1
 TETHER_LENGTH = 500.0
 
