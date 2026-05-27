@@ -31,7 +31,7 @@ MODE DEFINITIONS
 ----------------
 
 Traction:
-    Steady-state pure traction optimization.
+    Steady-state representative crosswind traction optimization.
 
     Objective:
         P_equiv_traction = Fx_ship * V_ship
@@ -39,6 +39,61 @@ Traction:
     where:
         Fx_ship = forward ship-force component [N]
         V_ship  = prescribed ship speed [m/s]
+
+    Representation:
+        A single representative steady crosswind operating state is used
+        instead of an instantaneous figure-of-eight maneuver.
+
+    Optimization variables:
+        [phi, beta, d]
+
+        phi   = azimuth angle [deg]
+        beta  = elevation angle [deg]
+        d     = depower coefficient [-]
+
+    Fixed assumptions:
+        - constant representative course angle (Schelbergen 2020)
+        - tether length fixed
+        - zero reeling factor
+
+    Aerodynamics:
+        Depower is represented through angle of attack rather than direct
+        coefficient interpolation.
+
+            d = 0 → depowered / reel-in-like AoA
+            d = 1 → powered / reel-out-like AoA
+
+        The model maps:
+
+            d → alpha_w → CL(alpha_w), CD(alpha_w)
+
+        using a small tabulated polar generated from the corrected TU Delft V3
+        polynomial coefficients reported by Cayon et al. Appendix C:
+
+            CL = 0.17 + 5.69*alpha_rad - 10.78*alpha_rad²
+            CD = 0.14 - 0.18*alpha_rad + 1.79*alpha_rad²
+
+        The selected AoA interval is currently:
+
+            alpha_depowered = 4.0 deg
+            alpha_powered   = 7.5 deg
+
+        This is intentionally not the raw CFD/VSM CSV polar, because the paper
+        notes that numerical aerodynamic models underpredict drag for flexible
+        LEI kites. The corrected polynomial gives a more conservative,
+        experiment-aligned drag level.
+
+        Effective lift-to-drag includes tether drag.
+
+    Feasibility:
+        The optimizer uses operational beta bounds, while the Schmehl
+        constraint defines the admissible phi range for each beta and L/D.
+
+            cos(beta) cos(phi) >= B(f, L/D)
+
+        with:
+
+            f = 0 for traction
 
 Pumping:
     Cyclic quasi-steady pumping optimization with moving-vessel apparent wind.
@@ -50,30 +105,37 @@ Pumping:
         P_cycle = cycle-averaged generated power [W]
         Fx_avg  = cycle-averaged forward ship-force [N]
 
-This accounts for propulsion assistance or propulsion penalty caused by
-the pumping cycle aerodynamic loading.
+    This accounts for propulsion assistance or propulsion penalty caused
+    by pumping-cycle aerodynamic loading.
 
-PUMPING FILTERING
------------------
-Optional rejection of traction-dominated pumping solutions:
+    Current aerodynamic treatment:
+        Pumping still uses the native binary QSM powered/depowered
+        aerodynamic states.
 
-    pump_ratio = P_cycle / abs(Fx_avg * V_ship)
+    Current limitations:
+        - no continuous depower optimization
+        - no explicit Schmehl feasibility screening yet
+        - course-angle treatment remains QSM-native
 
-If enabled, cases below:
+APPARENT WIND TREATMENT
+-----------------------
+The moving-vessel apparent wind is computed externally from:
 
-    PUMPING_MIN_PUMPING_RATIO_DIAGNOSTIC
+    true wind + prescribed vessel motion
 
-are rejected to prevent classifying force-dominated solutions as valid
-pumping operation.
+and passed into the QSM.
+
+No additional external static take-off apparent-wind threshold is imposed.
+QSM determines steady-state/cycle feasibility internally.
 
 HEADING SWEEP CONVENTION
 ------------------------
-- True wind direction fixed at 0°.
-- Ship heading ψ swept relative to wind.
-- QSM solves in apparent-wind-aligned coordinates.
-- Forces projected back to ship coordinates.
-- 0–180° computed directly.
-- Optional mirroring to 180–360° for plotting.
+- True wind direction fixed at 0°
+- Ship heading ψ swept relative to wind
+- QSM solved in apparent-wind-aligned coordinates
+- Forces projected back to ship coordinates
+- 0–180° computed directly
+- Optional mirroring to 180–360° for plotting
 
 OPTIMIZATION
 ------------
@@ -81,14 +143,15 @@ Traction:
     - SLSQP optimization
     - multistart candidate search
     - warm-start continuation
-    - tether-force and surge constraints
+    - tether-force constraint
+    - positive surge constraint
+    - Schmehl nonlinear wind-window constraint
 
 Pumping:
     - CycleOptimizer-based optimization
     - multistart initialization
     - warm-start continuation
     - feasibility filtering
-    - apparent wind activation threshold
 
 OUTPUTS
 -------
@@ -114,12 +177,20 @@ Requires:
     data/wind_resource.yml
     data/simulation_settings.yml
 
-CURRENT LIMITATION
-------------------
+CURRENT LIMITATIONS
+-------------------
 This implementation uses prescribed vessel motion only.
 
+Not yet included:
+    - full vessel PPP coupling
+    - pumping depower optimization
+    - pumping Schmehl feasibility enforcement
+    - unified aerodynamic architecture between traction and pumping
+
 Future extension:
-    full two-way vessel PPP coupling with speed/leeway equilibrium.
+    full two-way vessel PPP coupling with speed/leeway equilibrium
+    unified depower-aware aero handling for both modes
+    pumping-mode Schmehl feasibility enforcement
 """
 
 from __future__ import annotations
@@ -159,7 +230,7 @@ SAVE_CSV = True
 SAVE_CANDIDATE_LOGS = True
 
 # ---- Sweep settings ----------------------------------------------------------
-TRUE_WIND_SPEEDS = np.array([16.0], dtype=float)
+TRUE_WIND_SPEEDS = np.array([20.0], dtype=float)
 SHIP_SPEED = 4.0
 CLUSTER_ID = 1
 TETHER_LENGTH = 500.0
@@ -246,6 +317,29 @@ from inertiafree_qsm.coordinate_transforms import (
 from inertiafree_qsm.vessel_coupling import TrueWind, VesselMotion, compute_apparent_wind
 from inertiafree_qsm.cycle_optimizer import CycleOptimizer
 
+# =============================================================================
+# Aerodynamic properties TU Delft V3 kite
+
+# AoA bounds for depower model
+# d = 0 -> depowered / reel-in-like
+# d = 1 -> powered / reel-out-like
+ALPHA_DEPOWERED_DEG = 4.0
+ALPHA_POWERED_DEG = 7.5
+
+# Corrected TU Delft V3 aerodynamic polar based on Cayon et al. Appendix C.
+# alpha in deg, CL [-], CD [-]
+# Generated from:
+# CL = 0.17 + 5.69*alpha_rad - 10.78*alpha_rad**2
+# CD = 0.14 - 0.18*alpha_rad + 1.79*alpha_rad**2
+TRACTION_AERO_POLAR = np.array([
+    [3.0, 0.438, 0.135],
+    [4.0, 0.514, 0.136],
+    [5.0, 0.587, 0.138],
+    [6.0, 0.657, 0.141],
+    [7.0, 0.725, 0.145],
+    [8.0, 0.790, 0.150],
+], dtype=float)
+# =============================================================================
 
 # =============================================================================
 # Shared helpers
@@ -382,11 +476,88 @@ def create_constructor_and_environment():
 # Traction optimization
 # =============================================================================
 
-# [(azimuth_angle_min, azimuth_angle_max), (elevation_angle_min, elevation_angle_max), (course_angle_min, course_angle_max)]
-TRACTION_INITIAL_GUESS_DEG = np.array([11.5, 30.0, 93.0], dtype=float)
-TRACTION_BOUNDS_DEG = [(-90.0, 90.0), (10.0, 80.0), (-180.0, 180.0)]
-TRACTION_SCALING = np.array([30.0, 30.0, 180.0], dtype=float)
+TRACTION_FIXED_COURSE_ANGLE_DEG = 93.0
+RETRACTION_FIXED_COURSE_ANGLE_DEG = 180.0
 
+# Variables: [phi_deg, beta_deg, depower]
+TRACTION_INITIAL_GUESS_DEG = np.array([11.5, 35.0, 1.0], dtype=float)
+
+# Loose numerical bounds only. Physical wind-window feasibility is Schmehl's AWE book 2018 constraint.
+TRACTION_BOUNDS_DEG = [(-89.9, 89.9), (30, 89.0), (0.0, 1.0)]
+TRACTION_SCALING = np.array([30.0, 30.0, 1.0], dtype=float)
+
+def schmehl_B(reeling_factor, lift_to_drag):
+    f = float(reeling_factor)
+    LD = float(lift_to_drag)
+    return (np.sqrt(1.0 + LD**2 * (1.0 - f**2)) + f * LD**2) / (1.0 + LD**2)
+
+def get_base_aero_coefficients(sys_props):
+    return {
+        "CL_powered": float(sys_props.kite_lift_coefficient_powered),
+        "CD_powered": float(sys_props.kite_drag_coefficient_powered),
+        "CL_depowered": float(sys_props.kite_lift_coefficient_depowered),
+        "CD_depowered": float(sys_props.kite_drag_coefficient_depowered),
+    }
+
+
+def traction_alpha_from_depower(depower):
+    d = float(np.clip(depower, 0.0, 1.0))
+    return float(ALPHA_DEPOWERED_DEG + d * (ALPHA_POWERED_DEG - ALPHA_DEPOWERED_DEG))
+
+
+def traction_depower_coefficients(sys_props, depower):
+    alpha_deg = traction_alpha_from_depower(depower)
+
+    alpha_data = TRACTION_AERO_POLAR[:, 0]
+    CL_data = TRACTION_AERO_POLAR[:, 1]
+    CD_data = TRACTION_AERO_POLAR[:, 2]
+
+    CL = np.interp(alpha_deg, alpha_data, CL_data)
+    CD = np.interp(alpha_deg, alpha_data, CD_data)
+
+    return float(CL), float(CD)
+
+
+def effective_cd_and_lift_to_drag(sys_props, tether_length, depower):
+    CL, CD_kite = traction_depower_coefficients(sys_props, depower)
+
+    CD_tether = (
+        0.25
+        * sys_props.tether_diameter
+        * tether_length
+        / sys_props.kite_projected_area
+        * sys_props.tether_drag_coefficient
+    )
+
+    CD_eff = CD_kite + CD_tether
+    LD_eff = CL / CD_eff
+
+    return float(CL), float(CD_kite), float(CD_eff), float(LD_eff)
+
+
+def apply_traction_depower(sys_props, depower):
+    if getattr(sys_props, "_base_traction_aero", None) is None:
+        sys_props._base_traction_aero = get_base_aero_coefficients(sys_props)
+
+    CL, CD = traction_depower_coefficients(sys_props, depower)
+    sys_props.kite_lift_coefficient_powered = CL
+    sys_props.kite_drag_coefficient_powered = CD
+
+
+def restore_traction_aero(sys_props):
+    base = getattr(sys_props, "_base_traction_aero", None)
+    if base is None:
+        return
+
+    sys_props.kite_lift_coefficient_powered = base["CL_powered"]
+    sys_props.kite_drag_coefficient_powered = base["CD_powered"]
+
+def schmehl_window_margin(sys_props, phi_deg, beta_deg, depower, tether_length=TETHER_LENGTH, reeling_factor=0.0):
+    phi = np.deg2rad(phi_deg)
+    beta = np.deg2rad(beta_deg)
+    _, _, _, LD_eff = effective_cd_and_lift_to_drag(sys_props, tether_length, depower)
+
+    return float(np.cos(beta) * np.cos(phi) - schmehl_B(reeling_factor, LD_eff))
 
 def solve_traction_with_measured_tether_force(solver, wind, traction_input, vessel_state):
     old_limit = getattr(solver.sys_props, "tether_force_max_limit", None)
@@ -402,9 +573,15 @@ def solve_traction_with_measured_tether_force(solver, wind, traction_input, vess
 
 def evaluate_traction_operating_point(solver, true_wind_speed, ship_speed, heading_deg, x_deg):
     x_deg = np.asarray(x_deg, dtype=float)
-    azimuth_deg, elevation_deg, course_deg = x_deg
 
-    apparent_wind, vessel_heading = compute_case_apparent_wind(true_wind_speed, ship_speed, heading_deg)
+    azimuth_deg, elevation_deg, depower = x_deg
+    course_deg = TRACTION_FIXED_COURSE_ANGLE_DEG
+
+    apparent_wind, vessel_heading = compute_case_apparent_wind(
+        true_wind_speed,
+        ship_speed,
+        heading_deg,
+    )
 
     traction_input = PureTractionInput(
         tether_length=TETHER_LENGTH,
@@ -414,14 +591,37 @@ def evaluate_traction_operating_point(solver, true_wind_speed, ship_speed, headi
     )
 
     wind_qsm = WindCondition(speed=apparent_wind.speed, direction=0.0)
-    vessel_state_qsm = VesselState(speed=float(ship_speed), leeway_angle=0.0, heading=0.0)
-
-    result = solve_traction_with_measured_tether_force(
-        solver=solver,
-        wind=wind_qsm,
-        traction_input=traction_input,
-        vessel_state=vessel_state_qsm,
+    vessel_state_qsm = VesselState(
+        speed=float(ship_speed),
+        leeway_angle=0.0,
+        heading=0.0,
     )
+
+    CL, CD_kite, CD_eff, LD_eff = effective_cd_and_lift_to_drag(
+        solver.sys_props,
+        TETHER_LENGTH,
+        depower,
+    )
+
+    schmehl_margin = schmehl_window_margin(
+        solver.sys_props,
+        phi_deg=azimuth_deg,
+        beta_deg=elevation_deg,
+        depower=depower,
+        tether_length=TETHER_LENGTH,
+        reeling_factor=0.0,
+    )
+
+    apply_traction_depower(solver.sys_props, depower)
+    try:
+        result = solve_traction_with_measured_tether_force(
+            solver=solver,
+            wind=wind_qsm,
+            traction_input=traction_input,
+            vessel_state=vessel_state_qsm,
+        )
+    finally:
+        restore_traction_aero(solver.sys_props)
 
     Fx_ship, Fy_ship = qsm_kite_position_to_ship_force(
         tether_force_ground=result.tether_force_ground,
@@ -432,12 +632,20 @@ def evaluate_traction_operating_point(solver, true_wind_speed, ship_speed, headi
     )
 
     P_equiv = Fx_ship * ship_speed
+    alpha_deg = traction_alpha_from_depower(depower)
+
     return {
         "evaluation_success": True,
         "error_message": "",
         "azimuth_angle_deg": float(azimuth_deg),
         "elevation_angle_deg": float(elevation_deg),
         "course_angle_deg": float(course_deg),
+        "depower": float(depower),
+        "CL_traction": float(CL),
+        "CD_kite_traction": float(CD_kite),
+        "CD_eff_traction": float(CD_eff),
+        "LD_eff_traction": float(LD_eff),
+        "schmehl_margin": float(schmehl_margin),
         "true_wind_speed": float(true_wind_speed),
         "ship_speed": float(ship_speed),
         "heading_deg": float(heading_deg),
@@ -448,8 +656,8 @@ def evaluate_traction_operating_point(solver, true_wind_speed, ship_speed, headi
         "Fy": float(Fy_ship),
         "P_equiv_traction": float(P_equiv),
         "P_equiv_traction_kW": float(P_equiv / 1000.0),
+        "alpha_traction_deg": float(alpha_deg),
     }
-
 
 def add_projection_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
     Fx = safe_float(result.get("Fx"))
@@ -476,6 +684,19 @@ class TractionOptimizer:
         self._cache_x_scaled = None
         self._cache_result = None
 
+    def constraint_schmehl_window(self, x_scaled):
+        x = np.asarray(x_scaled, dtype=float) * TRACTION_SCALING
+        phi_deg, beta_deg, depower = x
+
+        return schmehl_window_margin(
+            self.solver.sys_props,
+            phi_deg=phi_deg,
+            beta_deg=beta_deg,
+            depower=depower,
+            tether_length=TETHER_LENGTH,
+            reeling_factor=0.0,
+        )
+
     def _evaluate_scaled(self, x_scaled):
         x_scaled = np.asarray(x_scaled, dtype=float)
         if self._cache_x_scaled is not None and np.allclose(x_scaled, self._cache_x_scaled, rtol=0.0, atol=1.0e-12):
@@ -491,7 +712,8 @@ class TractionOptimizer:
                 "error_message": str(exc),
                 "azimuth_angle_deg": float(x_deg[0]),
                 "elevation_angle_deg": float(x_deg[1]),
-                "course_angle_deg": float(x_deg[2]),
+                "course_angle_deg": float(TRACTION_FIXED_COURSE_ANGLE_DEG),
+                "depower": float(x_deg[2]),
                 "true_wind_speed": self.true_wind_speed,
                 "ship_speed": self.ship_speed,
                 "heading_deg": self.heading_deg,
@@ -532,6 +754,7 @@ class TractionOptimizer:
         x0_scaled = np.asarray(x0_deg, dtype=float) / TRACTION_SCALING
         bounds_scaled = [(lo / s, hi / s) for (lo, hi), s in zip(TRACTION_BOUNDS_DEG, TRACTION_SCALING)]
         constraints = [
+            {"type": "ineq", "fun": self.constraint_schmehl_window},
             {"type": "ineq", "fun": self.constraint_positive_surge},
             {"type": "ineq", "fun": self.constraint_tether_force},
         ]
@@ -565,37 +788,47 @@ class TractionOptimizer:
         final["constraint_active"] = bool(
             np.isclose(final["tether_force_ground"], self.tether_force_max - TRACTION_FORCE_SAFETY_MARGIN, rtol=0.0, atol=25.0)
         )
-        final["x_opt_deg"] = np.array([final["azimuth_angle_deg"], final["elevation_angle_deg"], final["course_angle_deg"]], dtype=float)
+        final["x_opt_deg"] = np.array(
+            [final["azimuth_angle_deg"], final["elevation_angle_deg"], final["depower"]],
+            dtype=float,
+        )
         return add_projection_diagnostics(final)
 
 
 def traction_candidate_starts(warm_start_deg=None):
     starts = []
+
     if warm_start_deg is not None:
         starts.append(np.asarray(warm_start_deg, dtype=float))
+
     starts.extend([
         TRACTION_INITIAL_GUESS_DEG,
-        np.array([-11.5, 30.0, -93.0]),
-        np.array([0.0, 10.0, 90.0]), np.array([0.0, 30.0, 90.0]), np.array([0.0, 45.0, 90.0]),
-        np.array([0.0, 10.0, -90.0]), np.array([0.0, 30.0, -90.0]), np.array([0.0, 45.0, -90.0]),
-        np.array([30.0, 20.0, 90.0]), np.array([-30.0, 20.0, -90.0]),
-        np.array([60.0, 30.0, 90.0]), np.array([-60.0, 30.0, -90.0]),
-        np.array([0.0, 10.0, 0.0]), np.array([15.0, 10.0, 0.0]), np.array([-15.0, 10.0, 0.0]),
-        np.array([30.0, 10.0, 0.0]), np.array([-30.0, 10.0, 0.0]),
-        np.array([60.0, 10.0, -30.0]), np.array([60.0, 15.0, 30.0]),
-        np.array([-60.0, 10.0, -30.0]), np.array([-60.0, 15.0, 30.0]),
+        np.array([0.0, 30.0, 1.0]),
+        np.array([0.0, 35.0, 1.0]),
+        np.array([11.5, 35.0, 1.0]),
+        np.array([-11.5, 35.0, 1.0]),
+        np.array([20.0, 30.0, 1.0]),
+        np.array([-20.0, 30.0, 1.0]),
+        np.array([0.0, 30.0, 0.75]),
+        np.array([11.5, 35.0, 0.75]),
+        np.array([-11.5, 35.0, 0.75]),
+        np.array([20.0, 30.0, 0.5]),
+        np.array([-20.0, 30.0, 0.5]),
     ])
+
     unique = []
     seen = set()
+
     for x in starts:
         key = tuple(np.round(x, 6))
         if key not in seen:
             seen.add(key)
             unique.append(x.astype(float))
+
     if TRACTION_MAX_CANDIDATE_STARTS is not None:
         unique = unique[:TRACTION_MAX_CANDIDATE_STARTS]
-    return unique
 
+    return unique
 
 def is_feasible_traction_result(result, tether_force_max):
     if not result.get("evaluation_success", False):
@@ -617,7 +850,7 @@ def build_traction_candidate_log_row(result, candidate_index, x0_deg, selected_b
         "case_runtime_s": result.get("case_runtime_s", np.nan),
         "start_azimuth_angle_deg": float(x0_deg[0]),
         "start_elevation_angle_deg": float(x0_deg[1]),
-        "start_course_angle_deg": float(x0_deg[2]),
+        "start_depower": float(x0_deg[2]),
         "evaluation_success": result.get("evaluation_success", False),
         "optimizer_success": result.get("optimizer_success", False),
         "accepted_result": result.get("accepted_result", False),
@@ -632,6 +865,12 @@ def build_traction_candidate_log_row(result, candidate_index, x0_deg, selected_b
         "projection_loss_angle_deg": result.get("projection_loss_angle_deg", np.nan),
         "optimized_P_equiv_traction": result.get("P_equiv_traction", np.nan),
         "optimized_P_equiv_traction_kW": result.get("P_equiv_traction_kW", np.nan),
+        "optimized_depower": result.get("depower", np.nan),
+        "optimized_CL_traction": result.get("CL_traction", np.nan),
+        "optimized_CD_kite_traction": result.get("CD_kite_traction", np.nan),
+        "optimized_CD_eff_traction": result.get("CD_eff_traction", np.nan),
+        "optimized_LD_eff_traction": result.get("LD_eff_traction", np.nan),
+        "schmehl_margin": result.get("schmehl_margin", np.nan),
     }
 
 
@@ -696,6 +935,7 @@ def build_traction_output_row(result, tether_force_max):
         "optimized_azimuth_angle_deg": result["azimuth_angle_deg"],
         "optimized_elevation_angle_deg": result["elevation_angle_deg"],
         "optimized_course_angle_deg": result["course_angle_deg"],
+        "optimized_depower": result.get("depower", np.nan),
         "optimized_Fx": result["Fx"],
         "optimized_Fy": result["Fy"],
         "optimized_tether_force_ground": result["tether_force_ground"],
@@ -711,6 +951,12 @@ def build_traction_output_row(result, tether_force_max):
         "constraint_active": result["constraint_active"],
         "optimized_P_equiv_traction": result["P_equiv_traction"],
         "optimized_P_equiv_traction_kW": result["P_equiv_traction"] / 1000.0,
+        "optimized_CL_traction": result.get("CL_traction", np.nan),
+        "optimized_CD_kite_traction": result.get("CD_kite_traction", np.nan),
+        "optimized_CD_eff_traction": result.get("CD_eff_traction", np.nan),
+        "optimized_LD_eff_traction": result.get("LD_eff_traction", np.nan),
+        "schmehl_margin": result.get("schmehl_margin", np.nan),
+        "optimized_alpha_traction_deg": result.get("alpha_traction_deg", np.nan),
     }
 
 
@@ -721,11 +967,12 @@ def print_traction_progress(wind_speed, i, total, heading_deg, row, accepted_cou
         T = row["optimized_tether_force_ground"]
         az = row["optimized_azimuth_angle_deg"]
         beta = row["optimized_elevation_angle_deg"]
+        d = row.get("optimized_depower", np.nan)
         course = row["optimized_course_angle_deg"]
         Fx_over_T = row.get("Fx_over_tether_force", np.nan)
         proj_loss = row.get("projection_loss_angle_deg", np.nan)
     else:
-        P_kw = Fx = T = az = beta = course = Fx_over_T = proj_loss = np.nan
+        P_kw = Fx = T = az = beta = d = course = Fx_over_T = proj_loss = np.nan
 
     best_kw = best_power / 1000.0 if np.isfinite(best_power) else np.nan
     msg = (
@@ -735,7 +982,7 @@ def print_traction_progress(wind_speed, i, total, heading_deg, row, accepted_cou
         f"tcand,max={format_s(row.get('max_candidate_runtime_s', np.nan))}s | "
         f"accepted={accepted_count:03d} | failed={failed_count:03d} | "
         f"Peq={P_kw:9.3f} kW | Fx={Fx:9.1f} N | T={T:9.1f} N | "
-        f"az={az:7.2f}° | β={beta:6.2f}° | course={course:8.2f}° | "
+        f"az={az:7.2f}° | β={beta:6.2f}° | d={d:5.2f} | course={course:8.2f}° | "
         f"Fx/T={Fx_over_T:6.3f} | loss={proj_loss:6.2f}° | best={best_kw:9.3f} kW"
     )
     sys.stdout.write("\r" + msg.ljust(360))
@@ -1125,11 +1372,6 @@ def optimize_one_pumping_heading_case(constructor, env_state, true_wind_speed, s
     case_start = time.perf_counter()
     apparent_wind, vessel_heading = compute_case_apparent_wind(true_wind_speed, ship_speed, heading_deg)
 
-    if apparent_wind.speed < min_apparent_wind_speed:
-        kpi = build_inactive_low_apparent_wind_kpi(true_wind_speed, ship_speed, heading_deg, apparent_wind, min_apparent_wind_speed)
-        kpi["case_runtime_s"] = time.perf_counter() - case_start
-        return kpi, warm_x0_base, []
-
     x0_candidates = build_pumping_x0_candidates(constructor.simulation_settings, apparent_wind.speed, warm_x0_base)
     results = []
     runtimes = []
@@ -1366,7 +1608,7 @@ def run_pumping_sweep(constructor, env_state):
     optimizer_settings["max_iterations"] = min(int(optimizer_settings.get("max_iterations", 200)), PUMPING_MAX_OPTIMIZER_ITERATIONS_DEBUG)
     constructor.simulation_settings["optimization"]["constraints"]["min_tether_length_fraction_difference"] = PUMPING_MIN_TETHER_LENGTH_FRACTION_DIFFERENCE
 
-    min_apparent_wind_speed = calculate_static_takeoff_wind_speed(constructor.sys_props, env_state)
+    min_apparent_wind_speed = 0.0
     physical_tether_force_max = get_tether_force_max(constructor)
 
     tether_force_max = (
@@ -1603,20 +1845,35 @@ def plot_traction_operating_angles(rows):
     accepted = [r for r in rows if r.get("accepted_result", False)]
     if not accepted:
         return
+
     diagnostic_wind_speed = float(TRUE_WIND_SPEEDS[-1])
     group = [r for r in accepted if np.isclose(float(r["true_wind_speed"]), diagnostic_wind_speed)]
     if not group:
         return
+
     group = sorted(group, key=lambda r: r["heading_deg"])
     headings = np.array([r["heading_deg"] for r in group], dtype=float)
+
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(headings, [r["optimized_azimuth_angle_deg"] for r in group], linewidth=1.8, label="azimuth angle")
     ax.plot(headings, [r["optimized_elevation_angle_deg"] for r in group], linewidth=1.8, label="elevation angle")
-    ax.plot(headings, [r["optimized_course_angle_deg"] for r in group], linewidth=1.8, label="course angle")
+
+    ax2 = ax.twinx()
+    ax2.plot(headings, [r.get("optimized_depower", np.nan) for r in group], linewidth=1.8, linestyle="--", label="depower d")
+
     ax.set_xlabel("Ship heading ψ [deg]")
     ax.set_ylabel("Optimized angle [deg]")
-    ax.set_title(f"Optimized traction operating angles\nTrue wind = {diagnostic_wind_speed:.1f} m/s, ship speed = {SHIP_SPEED:.1f} m/s")
-    ax.legend()
+    ax2.set_ylabel("Depower coefficient d [-]")
+
+    ax.set_title(
+        f"Optimized traction control variables\n"
+        f"True wind = {diagnostic_wind_speed:.1f} m/s, ship speed = {SHIP_SPEED:.1f} m/s"
+    )
+
+    lines_1, labels_1 = ax.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax.legend(lines_1 + lines_2, labels_1 + labels_2)
+
     ax.grid(True)
     finalize_figure(fig, TRACTION_ANGLES_FIG_PATH)
 

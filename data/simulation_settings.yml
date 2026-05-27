@@ -74,7 +74,7 @@ optimization:
       reeling_speed_retraction: true
       fraction_tether_length_traction_end: true
       fraction_tether_length_retraction_end: true
-      elevation_angle_traction: true
+      elevation_angle_traction: false
       elevation_angle_end_trans_rori: true
 
     opt_phase_timestep:
@@ -151,7 +151,7 @@ cycle:
 
   minimum_height: 100.0 # Minimum height of the kite during the cycle (m)
 
-  elevation_angle_traction: [30.0, 30.0, 30.0, 30.0]
+  elevation_angle_traction: [30.0]
 
   # Tether length at end of traction phase as fraction of max tether length [-]
   # (= start of RORI transition; must be < 1.0 to leave reel-out headroom)
