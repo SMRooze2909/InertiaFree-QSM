@@ -382,6 +382,7 @@ def create_constructor_and_environment():
 # Traction optimization
 # =============================================================================
 
+# [(azimuth_angle_min, azimuth_angle_max), (elevation_angle_min, elevation_angle_max), (course_angle_min, course_angle_max)]
 TRACTION_INITIAL_GUESS_DEG = np.array([11.5, 30.0, 93.0], dtype=float)
 TRACTION_BOUNDS_DEG = [(-90.0, 90.0), (10.0, 80.0), (-180.0, 180.0)]
 TRACTION_SCALING = np.array([30.0, 30.0, 180.0], dtype=float)
